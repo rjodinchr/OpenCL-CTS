@@ -178,6 +178,119 @@ jobs:
                 -DVULKAN_LIB_DIR='${{ github.workspace }}'/Vulkan-Loader/build/loader/ \
                 ${CMAKE_ADDITIONAL_CONFIG_ARGS}
           cmake --build . --parallel
+
+  test_pr:
+    name: Run PR Tests (pocl)
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Parse Commit Messages for Triggers
+        id: check_triggers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MESSAGES=$(gh api -X GET /repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/commits --jq '.[].commit.message')
+          COMMANDS=$(echo "$MESSAGES" | grep -oP '\[run-tests?:\s*\K[^\]]+' || true)
+          if [ -z "$COMMANDS" ]; then
+            echo "No '[run-test: ...]' triggers found. Skipping job."
+            echo "run_tests=false" >> $GITHUB_OUTPUT
+          else
+            echo "Found the following test triggers:"
+            echo "$COMMANDS"
+            echo "run_tests=true" >> $GITHUB_OUTPUT
+            echo "$COMMANDS" > test_commands.txt
+          fi
+      - name: Setup Ninja
+        if: steps.check_triggers.outputs.run_tests == 'true'
+        uses: seanmiddleditch/gha-setup-ninja@master
+      - name: Cache pocl
+        id: cache-pocl
+        if: steps.check_triggers.outputs.run_tests == 'true'
+        uses: actions/cache@v4
+        with:
+          path: /opt/pocl
+          key: ubuntu-22.04-pocl-7.1
+      - name: Build pocl
+        if: steps.check_triggers.outputs.run_tests == 'true' && steps.cache-pocl.outputs.cache-hit != 'true'
+        run: |
+          export LLVM_VERSION=18
+          sudo apt-get install -y \
+            python3-dev libpython3-dev build-essential ocl-icd-libopencl1 \
+            cmake git pkg-config libclang-${LLVM_VERSION}-dev clang-${LLVM_VERSION} \
+            llvm-${LLVM_VERSION} make ninja-build ocl-icd-libopencl1 ocl-icd-dev \
+            ocl-icd-opencl-dev libhwloc-dev zlib1g zlib1g-dev clinfo dialog apt-utils \
+            libxml2-dev libclang-cpp${LLVM_VERSION}-dev libclang-cpp${LLVM_VERSION} \
+            llvm-${LLVM_VERSION}-dev
+          git clone --depth 1 --branch v7.1 https://github.com/pocl/pocl.git
+          cmake -B pocl/build -S pocl -G Ninja \
+            -DCMAKE_INSTALL_PREFIX=/opt/pocl \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_ICD=ON
+          cmake --build pocl/build
+          cmake --install pocl/build
+      - name: Cache loader
+        id: cache-loader
+        if: steps.check_triggers.outputs.run_tests == 'true'
+        uses: actions/cache@v4
+        with:
+          path: /opt/loader
+          key: ubuntu-22.04-loader-v2025.07.22
+      - name: Build loader
+        if: steps.check_triggers.outputs.run_tests == 'true' && steps.cache-loader.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v2025.07.22 https://github.com/KhronosGroup/OpenCL-Headers.git
+          git clone --depth 1 --branch v2025.07.22 https://github.com/KhronosGroup/OpenCL-ICD-Loader.git
+          cmake -B OpenCL-ICD-Loader/build -S OpenCL-ICD-Loader -G Ninja \
+            -DCMAKE_INSTALL_PREFIX=/opt/loader \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR='${{ github.workspace }}'/OpenCL-Headers/
+          cmake --build OpenCL-ICD-Loader/build
+          cmake --install OpenCL-ICD-Loader/build
+      - name: Build OpenCL CTS
+        if: steps.check_triggers.outputs.run_tests == 'true'
+        shell: bash
+        run: |
+          cmake -B build -S . -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCL_INCLUDE_DIR='${{ github.workspace }}'/OpenCL-Headers \
+                -DCL_LIB_DIR=/opt/loader/lib \
+                -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=./bin \
+                -DOPENCL_LIBRARIES="-lOpenCL -lpthread" \
+                -DUSE_CL_EXPERIMENTAL=ON \
+                -DGL_IS_SUPPORTED=OFF \
+                -DVULKAN_IS_SUPPORTED=OFF
+          cmake --build build
+      - name: Run Triggered Tests
+        if: steps.check_triggers.outputs.run_tests == 'true'
+        shell: bash
+        run: |
+          export OCL_ICD_VENDORS=/opt/pocl/etc/OpenCL/vendors
+          export LD_LIBRARY_PATH=/opt/loader/lib:$LD_LIBRARY_PATH
+          mkdir -p test_results
+          while IFS= read -r cmd; do
+            if [ -n "$cmd" ]; then
+              SAFE_NAME=$(echo "$cmd" | sed -e 's/[^A-Za-z0-9._-]/_/g')
+              RESULT_FILE="test_results/${SAFE_NAME}.json"
+              export CL_CONFORMANCE_RESULTS_FILENAME="$RESULT_FILE"
+              echo "=================================================="
+              echo "Executing: ./$cmd"
+              echo "Writing JSON result to: $RESULT_FILE"
+              echo "=================================================="
+              # Execute the command and append || true so a failing test
+              # does not kill the bash script or the GitHub Action step.
+              ./build/bin/$cmd || true
+            fi
+          done < test_commands.txt
+      - name: Compare Results against Golden Reference
+        if: steps.check_triggers.outputs.run_tests == 'true'
+        shell: bash
+        run: |
+          python3 ./ci/compare_results.py \
+            --golden ./ci/pocl_reference.json \
+            --results-dir test_results/
+
   formatcheck:
     name: Check code format
     runs-on: ubuntu-22.04
