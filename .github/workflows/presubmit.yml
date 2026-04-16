@@ -1,10 +1,11 @@
 name: Presubmit
-on: [push, pull_request]
+on: [pull_request]
 
 jobs:
   build:
     name: Build ${{ matrix.os }} ${{ matrix.arch }}${{ matrix.extra }}
     runs-on: ${{ matrix.os }}
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -181,6 +182,7 @@ jobs:
   formatcheck:
     name: Check code format
     runs-on: ubuntu-22.04
+    if: github.event_name == 'push'
     steps:
       - name: Install packages
         run: sudo apt install -y clang-format clang-format-14
