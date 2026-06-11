@@ -46,7 +46,8 @@ test_get_image_info_1D_buffer(cl_device_id device, cl_context context,
 
 int test_image_type(cl_device_id device, cl_context context,
                     cl_command_queue queue, cl_mem_object_type imageType,
-                    cl_mem_flags flags, const context_t &ctx)
+                    cl_mem_flags flags, cl_channel_type channel_type,
+                    const context_t &ctx)
 {
     log_info( "Running %s %s-only tests...\n", convert_image_type_to_string(imageType), flags == CL_MEM_READ_ONLY ? "read" : "write" );
 
@@ -57,7 +58,7 @@ int test_image_type(cl_device_id device, cl_context context,
     if (get_format_list(context, imageType, formatList, flags)) return -1;
 
     std::vector<bool> filterFlags(formatList.size(), false);
-    filter_formats(formatList, filterFlags, nullptr, ctx.channelTypeToUse,
+    filter_formats(formatList, filterFlags, nullptr, channel_type,
                    ctx.channelOrderToUse);
 
     // Run the format list
@@ -117,7 +118,7 @@ int test_image_type(cl_device_id device, cl_context context,
 
 int test_image_set(cl_device_id device, cl_context context,
                    cl_command_queue queue, cl_mem_object_type imageType,
-                   const context_t &ctx)
+                   cl_channel_type channel_type, const context_t &ctx)
 {
     int version_check;
     auto version = get_device_cl_version(device);
@@ -136,11 +137,11 @@ int test_image_set(cl_device_id device, cl_context context,
     }
     }
 
-  int ret = 0;
-  ret +=
-      test_image_type(device, context, queue, imageType, CL_MEM_READ_ONLY, ctx);
-  ret += test_image_type(device, context, queue, imageType, CL_MEM_WRITE_ONLY,
-                         ctx);
+    int ret = 0;
+    ret += test_image_type(device, context, queue, imageType, CL_MEM_READ_ONLY,
+                           channel_type, ctx);
+    ret += test_image_type(device, context, queue, imageType, CL_MEM_WRITE_ONLY,
+                           channel_type, ctx);
 
-  return ret;
+    return ret;
 }

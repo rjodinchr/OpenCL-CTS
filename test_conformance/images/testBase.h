@@ -43,7 +43,6 @@ typedef struct
     cl_addressing_mode addressModeToUse;
     cl_mem_flags memFlagsToUse;
     cl_filter_mode filterModeToUse;
-    cl_channel_type channelTypeToUse;
     cl_channel_order channelOrderToUse;
 } context_t;
 
@@ -65,7 +64,6 @@ static inline void init_context(context_t &ctx)
     ctx.addressModeToUse = (cl_addressing_mode)-1;
     ctx.memFlagsToUse = CL_MEM_USE_HOST_PTR;
     ctx.filterModeToUse = (cl_filter_mode)-1;
-    ctx.channelTypeToUse = (cl_channel_type)-1;
     ctx.channelOrderToUse = (cl_channel_order)-1;
 }
 
