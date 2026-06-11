@@ -115,7 +115,7 @@ int test_copy_image_generic(cl_context context, cl_command_queue queue,
                             BufferOwningPtr<char> &dstHost,
                             const size_t sourcePos[], const size_t destPos[],
                             const size_t regionSize[], MTdata d,
-                            const context_t &ctx)
+                            const image_test_context_t &ctx)
 {
     int error;
 
