@@ -22,18 +22,15 @@
 #include <CL/opencl.h>
 #endif
 
-#if (defined(__arm__) || defined(__aarch64__)) && defined(__GNUC__)
-#include "fplib.h"
-extern bool qcom_sat;
-extern roundingMode qcom_rm;
-#endif
-
 #include <CL/cl_half.h>
 
 #include "harness/conversions.h"
 #include "harness/mt19937.h"
 #include "harness/rounding_mode.h"
 #include "harness/typeWrappers.h"
+
+#include "basic_test_conversions.h"
+#include "fplib.h"
 
 #include <cmath>
 #include <cstring>
@@ -42,19 +39,6 @@ extern roundingMode qcom_rm;
 #include <sys/param.h>
 #include <libgen.h>
 #endif
-
-extern size_t gTypeSizes[kTypeCount];
-extern void *gIn;
-extern bool gTestAll;
-extern std::recursive_mutex gLock;
-
-typedef enum
-{
-    kUnsaturated = 0,
-    kSaturated,
-
-    kSaturationModeCount
-} SaturationMode;
 
 struct DataInitInfo
 {
@@ -65,8 +49,12 @@ struct DataInitInfo
     SaturationMode sat;
     RoundingMode round;
     cl_uint threads;
+    struct buffers &buffers;
 
-    static cl_half_rounding_mode halfRoundingMode;
+    cl_half_rounding_mode halfRoundingMode;
+#if CONVERSIONS_QCOM
+    roundingMode qcom_rm;
+#endif
 };
 
 #define HFF(num) cl_half_from_float(num, DataInitInfo::halfRoundingMode)
@@ -288,8 +276,8 @@ DataInfoSpec<InType, OutType, InFP, OutFP>::DataInfoSpec(
         float outMin = static_cast<float>(ranges.first);
         float outMax = static_cast<float>(ranges.second);
         float eps = CL_HALF_EPSILON;
-        cl_half_rounding_mode prev_half_round = DataInitInfo::halfRoundingMode;
-        DataInitInfo::halfRoundingMode = CL_HALF_RTZ;
+        cl_half_rounding_mode prev_half_round = halfRoundingMode;
+        halfRoundingMode = CL_HALF_RTZ;
 
         if (std::is_integral<OutType>::value)
         { // to char/uchar/short/ushort/int/uint/long/ulong
@@ -325,7 +313,7 @@ DataInfoSpec<InType, OutType, InFP, OutFP>::DataInfoSpec(
             }
         }
 
-        DataInitInfo::halfRoundingMode = prev_half_round;
+        halfRoundingMode = prev_half_round;
     }
     // clang-format on
 }
@@ -538,7 +526,7 @@ void DataInfoSpec<InType, OutType, InFP, OutFP>::conv(OutType *out, InType *in)
             }
 #else
             InType l = ((InType *)in)[0];
-#if (defined(__arm__) || defined(__aarch64__)) && defined(__GNUC__)
+#if CONVERSIONS_QCOM
             /* ARM VFP doesn't have hardware instruction for converting from
              * 64-bit integer to float types, hence GCC ARM uses the
              * floating-point emulation code despite which -mfloat-abi setting
@@ -552,9 +540,11 @@ void DataInfoSpec<InType, OutType, InFP, OutFP>::conv(OutType *out, InType *in)
              * cannot guarantee the compiler will use it.  On all ARM
              * architechures use emulation to calculate reference.*/
             if (std::is_same<cl_ulong, InType>::value)
-                outVal = qcom_u64_2_f32(l, qcom_sat, qcom_rm);
+                outVal = qcom_u64_2_f32(l, sat == kSaturated, qcom_rm);
             else
-                outVal = (l == 0 ? 0.0f : qcom_s64_2_f32(l, qcom_sat, qcom_rm));
+                outVal =
+                    (l == 0 ? 0.0f
+                            : qcom_s64_2_f32(l, sat == kSaturated, qcom_rm));
 #else
             outVal = (l == 0 ? 0.0f : (float)l); // Per IEEE-754-2008 5.4.1, 0's
                                                  // always convert to +0.0
@@ -760,7 +750,7 @@ void DataInfoSpec<InType, OutType, InFP, OutFP>::init(const cl_uint &job_id,
                                                       const cl_uint &thread_id)
 {
     const uint64_t ulStart = start;
-    void *pIn = (char *)gIn + job_id * size * gTypeSizes[inType];
+    void *pIn = (char *)buffers.in + job_id * size * gTypeSizes[inType];
 
     if constexpr (sizeof(InType) <= sizeof(uint8_t))
     {
