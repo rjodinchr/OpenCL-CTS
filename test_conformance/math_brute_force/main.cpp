@@ -58,7 +58,6 @@
 
 cl_device_id gDevice = NULL;
 cl_context gContext = NULL;
-cl_command_queue gQueue = NULL;
 static size_t gStartTestNumber = ~0u;
 static size_t gEndTestNumber = ~0u;
 int gSkipCorrectnessTesting = 0;
@@ -89,19 +88,24 @@ int gCheckTininessBeforeRounding = 1;
 int gIsInRTZMode = 0;
 uint32_t gMaxVectorSizeIndex = VECTOR_SIZE_COUNT;
 uint32_t gMinVectorSizeIndex = 0;
-void *gIn = NULL;
-void *gIn2 = NULL;
-void *gIn3 = NULL;
-void *gOut_Ref = NULL;
-void *gOut[VECTOR_SIZE_COUNT] = { NULL, NULL, NULL, NULL, NULL, NULL };
-void *gOut_Ref2 = NULL;
-void *gOut2[VECTOR_SIZE_COUNT] = { NULL, NULL, NULL, NULL, NULL, NULL };
-cl_mem gInBuffer = NULL;
-cl_mem gInBuffer2 = NULL;
-cl_mem gInBuffer3 = NULL;
-cl_mem gOutBuffer[VECTOR_SIZE_COUNT] = { NULL, NULL, NULL, NULL, NULL, NULL };
-cl_mem gOutBuffer2[VECTOR_SIZE_COUNT] = { NULL, NULL, NULL, NULL, NULL, NULL };
-static MTdataHolder gMTdata;
+
+thread_local MathResources *gThreadResources = nullptr;
+MathResources *gActiveThreadPoolResources = nullptr;
+std::mutex gThreadPoolMutex;
+std::mutex gStatsMutex;
+
+MathResourcesPool gResourcesPool;
+
+cl_int MathThreadPool_Do(TPFuncPtr func_ptr, cl_uint count, void *userInfo,
+                         MathResources *res)
+{
+    std::lock_guard<std::mutex> lock(gThreadPoolMutex);
+    gActiveThreadPoolResources = res;
+    cl_int err = (ThreadPool_Do)(func_ptr, count, userInfo);
+    gActiveThreadPoolResources = nullptr;
+    return err;
+}
+MTdataHolder gMTdata_global;
 cl_device_fp_config gFloatCapabilities = 0;
 int gWimpyReductionFactor = 32;
 int gVerboseBruteForce = 0;
@@ -114,7 +118,6 @@ static test_status ParseArgs(int &argc, const char *argv[],
                              std::vector<std::string> &removed_args,
                              std::string &help);
 static test_status InitCL(cl_device_id device);
-static void ReleaseCL(void);
 static int InitILogbConstants(void);
 static int IsTininessDetectedBeforeRounding(void);
 static int
@@ -174,6 +177,8 @@ static int doTest(const char *name)
         }
     }
     {
+        ResourceGuard guard;
+
         if (0 == strcmp("ilogb", func_data->name))
         {
             InitILogbConstants();
@@ -183,12 +188,16 @@ static int doTest(const char *name)
         {
             if (get_device_cl_version(gDevice) > Version(1, 2))
             {
-                gTestCount++;
-                vlog("%3d: ", gTestCount);
+                {
+                    std::lock_guard<std::mutex> lock(gStatsMutex);
+                    gTestCount++;
+                    vlog("%3d: ", gTestCount);
+                }
                 // Test with relaxed requirements here.
                 if (func_data->vtbl_ptr->TestFunc(func_data, gMTdata,
                                                   true /* relaxed mode */))
                 {
+                    std::lock_guard<std::mutex> lock(gStatsMutex);
                     gFailCount++;
                     error++;
                     if (gStopOnError)
@@ -207,12 +216,16 @@ static int doTest(const char *name)
 
         if (gTestFloat)
         {
-            gTestCount++;
-            vlog("%3d: ", gTestCount);
+            {
+                std::lock_guard<std::mutex> lock(gStatsMutex);
+                gTestCount++;
+                vlog("%3d: ", gTestCount);
+            }
             // Don't test with relaxed requirements.
             if (func_data->vtbl_ptr->TestFunc(func_data, gMTdata,
                                               false /* relaxed mode */))
             {
+                std::lock_guard<std::mutex> lock(gStatsMutex);
                 gFailCount++;
                 error++;
                 if (gStopOnError)
@@ -226,12 +239,16 @@ static int doTest(const char *name)
         if (gHasDouble && NULL != func_data->vtbl_ptr->DoubleTestFunc
             && NULL != func_data->dfunc.p)
         {
-            gTestCount++;
-            vlog("%3d: ", gTestCount);
+            {
+                std::lock_guard<std::mutex> lock(gStatsMutex);
+                gTestCount++;
+                vlog("%3d: ", gTestCount);
+            }
             // Don't test with relaxed requirements.
             if (func_data->vtbl_ptr->DoubleTestFunc(func_data, gMTdata,
                                                     false /* relaxed mode*/))
             {
+                std::lock_guard<std::mutex> lock(gStatsMutex);
                 gFailCount++;
                 error++;
                 if (gStopOnError)
@@ -244,11 +261,15 @@ static int doTest(const char *name)
 
         if (gHasHalf && NULL != func_data->vtbl_ptr->HalfTestFunc)
         {
-            gTestCount++;
-            vlog("%3d: ", gTestCount);
+            {
+                std::lock_guard<std::mutex> lock(gStatsMutex);
+                gTestCount++;
+                vlog("%3d: ", gTestCount);
+            }
             if (func_data->vtbl_ptr->HalfTestFunc(func_data, gMTdata,
                                                   false /* relaxed mode*/))
             {
+                std::lock_guard<std::mutex> lock(gStatsMutex);
                 gFailCount++;
                 error++;
                 if (gStopOnError)
@@ -385,13 +406,7 @@ int main(int argc, const char *argv[])
 
     RestoreFPState(&oldMode);
 
-    if (gQueue)
-    {
-        int error_code = clFinish(gQueue);
-        if (error_code) vlog_error("clFinish failed:%d\n", error_code);
-    }
-
-    ReleaseCL();
+    gResourcesPool.ReleaseAll();
 
     return ret;
 }
@@ -574,8 +589,6 @@ static test_status ParseArgs(int &argc, const char *argv[],
     vlog("\n---------------------------------------------------------------"
          "--------------------------------------------\n");
 
-    gMTdata = MTdataHolder(gRandomSeed);
-
     initInputCount(gWimpyReductionFactor);
     return TEST_PASS;
 }
@@ -721,109 +734,17 @@ test_status InitCL(cl_device_id device)
         return TEST_FAIL;
     }
 
-    gQueue = clCreateCommandQueue(gContext, gDevice, 0, &error);
-    if (NULL == gQueue || error)
     {
-        vlog_error("clCreateCommandQueue failed. (%d)\n", error);
-        return TEST_FAIL;
-    }
-
-    // Allocate buffers
-    cl_uint min_alignment = 0;
-    error = clGetDeviceInfo(gDevice, CL_DEVICE_MEM_BASE_ADDR_ALIGN,
-                            sizeof(cl_uint), (void *)&min_alignment, NULL);
-    if (CL_SUCCESS != error)
-    {
-        vlog_error("clGetDeviceInfo failed. (%d)\n", error);
-        return TEST_FAIL;
-    }
-    min_alignment >>= 3; // convert bits to bytes
-
-    gIn = align_malloc(BUFFER_SIZE, min_alignment);
-    if (NULL == gIn) return TEST_FAIL;
-    gIn2 = align_malloc(BUFFER_SIZE, min_alignment);
-    if (NULL == gIn2) return TEST_FAIL;
-    gIn3 = align_malloc(BUFFER_SIZE, min_alignment);
-    if (NULL == gIn3) return TEST_FAIL;
-    gOut_Ref = align_malloc(BUFFER_SIZE, min_alignment);
-    if (NULL == gOut_Ref) return TEST_FAIL;
-    gOut_Ref2 = align_malloc(BUFFER_SIZE, min_alignment);
-    if (NULL == gOut_Ref2) return TEST_FAIL;
-
-    for (i = gMinVectorSizeIndex; i < gMaxVectorSizeIndex; i++)
-    {
-        gOut[i] = align_malloc(BUFFER_SIZE, min_alignment);
-        if (NULL == gOut[i]) return TEST_FAIL;
-        gOut2[i] = align_malloc(BUFFER_SIZE, min_alignment);
-        if (NULL == gOut2[i]) return TEST_FAIL;
-    }
-
-    cl_mem_flags device_flags = CL_MEM_READ_ONLY;
-    // save a copy on the host device to make this go faster
-    if (CL_DEVICE_TYPE_CPU == device_type)
-        device_flags |= CL_MEM_USE_HOST_PTR;
-    else
-        device_flags |= CL_MEM_COPY_HOST_PTR;
-
-    // setup input buffers
-    gInBuffer =
-        clCreateBuffer(gContext, device_flags, BUFFER_SIZE, gIn, &error);
-    if (gInBuffer == NULL || error)
-    {
-        vlog_error("clCreateBuffer1 failed for input (%d)\n", error);
-        return TEST_FAIL;
-    }
-
-    gInBuffer2 =
-        clCreateBuffer(gContext, device_flags, BUFFER_SIZE, gIn2, &error);
-    if (gInBuffer2 == NULL || error)
-    {
-        vlog_error("clCreateBuffer2 failed for input (%d)\n", error);
-        return TEST_FAIL;
-    }
-
-    gInBuffer3 =
-        clCreateBuffer(gContext, device_flags, BUFFER_SIZE, gIn3, &error);
-    if (gInBuffer3 == NULL || error)
-    {
-        vlog_error("clCreateBuffer3 failed for input (%d)\n", error);
-        return TEST_FAIL;
-    }
-
-
-    // setup output buffers
-    device_flags = CL_MEM_READ_WRITE;
-    // save a copy on the host device to make this go faster
-    if (CL_DEVICE_TYPE_CPU == device_type)
-        device_flags |= CL_MEM_USE_HOST_PTR;
-    else
-        device_flags |= CL_MEM_COPY_HOST_PTR;
-    for (i = gMinVectorSizeIndex; i < gMaxVectorSizeIndex; i++)
-    {
-        gOutBuffer[i] = clCreateBuffer(gContext, device_flags, BUFFER_SIZE,
-                                       gOut[i], &error);
-        if (gOutBuffer[i] == NULL || error)
+        ResourceGuard guard;
+        // we are embedded, check current rounding mode
+        if (gIsEmbedded)
         {
-            vlog_error("clCreateBuffer failed for output (%d)\n", error);
-            return TEST_FAIL;
+            gIsInRTZMode = IsInRTZMode();
         }
-        gOutBuffer2[i] = clCreateBuffer(gContext, device_flags, BUFFER_SIZE,
-                                        gOut2[i], &error);
-        if (gOutBuffer2[i] == NULL || error)
-        {
-            vlog_error("clCreateBuffer2 failed for output (%d)\n", error);
-            return TEST_FAIL;
-        }
-    }
 
-    // we are embedded, check current rounding mode
-    if (gIsEmbedded)
-    {
-        gIsInRTZMode = IsInRTZMode();
+        // Check tininess detection
+        IsTininessDetectedBeforeRounding();
     }
-
-    // Check tininess detection
-    IsTininessDetectedBeforeRounding();
 
     cl_platform_id platform;
     int err = clGetDeviceInfo(gDevice, CL_DEVICE_PLATFORM, sizeof(platform),
@@ -911,33 +832,6 @@ test_status InitCL(cl_device_id device)
     }
 
     return TEST_PASS;
-}
-
-static void ReleaseCL(void)
-{
-    uint32_t i;
-    clReleaseMemObject(gInBuffer);
-    clReleaseMemObject(gInBuffer2);
-    clReleaseMemObject(gInBuffer3);
-    for (i = gMinVectorSizeIndex; i < gMaxVectorSizeIndex; i++)
-    {
-        clReleaseMemObject(gOutBuffer[i]);
-        clReleaseMemObject(gOutBuffer2[i]);
-    }
-    clReleaseCommandQueue(gQueue);
-    clReleaseContext(gContext);
-
-    align_free(gIn);
-    align_free(gIn2);
-    align_free(gIn3);
-    align_free(gOut_Ref);
-    align_free(gOut_Ref2);
-
-    for (i = gMinVectorSizeIndex; i < gMaxVectorSizeIndex; i++)
-    {
-        align_free(gOut[i]);
-        align_free(gOut2[i]);
-    }
 }
 
 int InitILogbConstants(void)
