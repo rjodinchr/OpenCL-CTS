@@ -45,7 +45,7 @@
 #define kMaxVectorSize 16
 #define kPageSize 4096
 
-#define BUFFER_SIZE (1024 * 1024)
+#define BUFFER_SIZE (1024 * 1024 * 8)
 #define EMBEDDED_REDUCTION_FACTOR 16
 
 #if (defined(__arm__) || defined(__aarch64__)) && defined(__GNUC__)
