@@ -106,6 +106,7 @@ int TestFunc_Half_UShort(const Func *f, MTdata d, bool relaxedMode)
         }
 
         // Run the kernels
+        cl_event e[VECTOR_SIZE_COUNT];
         for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
         {
             size_t vectorSize = sizeValues[j] * sizeof(cl_half);
@@ -124,6 +125,13 @@ int TestFunc_Half_UShort(const Func *f, MTdata d, bool relaxedMode)
                 vlog_error("FAILED -- could not execute kernel\n");
                 return error;
             }
+            if ((error =
+                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_FALSE, 0,
+                                         bufferSize, gOut[j], 0, NULL, &e[j])))
+            {
+                vlog_error("ReadArray failed %d\n", error);
+                return error;
+            }
         }
 
         // Get that moving
@@ -138,26 +146,25 @@ int TestFunc_Half_UShort(const Func *f, MTdata d, bool relaxedMode)
             else
                 r[j] = HFF(f->func.f_u(p[j]));
         }
-        // Read the data back
-        for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-        {
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_TRUE, 0,
-                                         bufferSize, gOut[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray failed %d\n", error);
-                return error;
-            }
-        }
 
         // Verify data
         cl_ushort *t = (cl_ushort *)gOut_Ref;
-        for (size_t j = 0; j < bufferElements; j++)
+        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
         {
-            for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+            // Wait for the map to finish
+            if ((error = clWaitForEvents(1, e + k)))
             {
-                cl_ushort *q = (cl_ushort *)(gOut[k]);
-
+                vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+                return error;
+            }
+            if ((error = clReleaseEvent(e[k])))
+            {
+                vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+                return error;
+            }
+            cl_ushort *q = (cl_ushort *)(gOut[k]);
+            for (size_t j = 0; j < bufferElements; j++)
+            {
                 // If we aren't getting the correctly rounded result
                 if (t[j] != q[j])
                 {
