@@ -32,6 +32,8 @@
 #define SHORT_MATH_SHIFT_SIZE 23
 #define CHAR_MATH_SHIFT_SIZE 16
 
+#define BUFFER_SIZE (1024 * 1024 * 8)
+
 static const char *kernel_code =
 "__kernel void test(__global %s%s *srcA, __global %s%s *srcB, __global %s%s *dst)\n"
 "{\n"
@@ -539,7 +541,7 @@ cl_int test_integer_ops_do_thread( cl_uint job_id, cl_uint thread_id, void *user
 }
 
 int test_integer_ops_threaded(cl_device_id deviceID, cl_context context,
-                              int num_elements,
+                              size_t buffer_size,
                               const std::vector<int> &vectorSizes,
                               TestStyle style, int num_runs_shift,
                               ExplicitType type, int testID)
@@ -585,12 +587,12 @@ int test_integer_ops_threaded(cl_device_id deviceID, cl_context context,
     maxDeviceGlobalMem = (maxDeviceGlobalMem * 3) >> 2;
     // Now reduce num_elements so that the total device memory usage does not exceed 75% of global device memory.
     size_t type_size = get_explicit_type_size(type);
-    while ((cl_ulong)threadcount * (2 + 6) * num_elements * type_size
-           > maxDeviceGlobalMem)
+    while ((cl_ulong)threadcount * (2 + 6) * buffer_size > maxDeviceGlobalMem)
     {
-        num_elements >>= 1;
+        buffer_size >>= 1;
     }
 
+    size_t num_elements = buffer_size / type_size;
     uint64_t startIndx = (uint64_t)0;
     uint64_t endIndx = (1ULL<<num_runs_shift);
     uint64_t jobcount = (endIndx-startIndx)/num_elements;
@@ -854,7 +856,7 @@ int test_integer_ops(cl_device_id deviceID, cl_context context,
 
 // Run all the vector sizes for a given test
 int run_specific_test(cl_device_id deviceID, cl_context context, cl_command_queue queue, int num_elements, ExplicitType type, int num, int testID) {
-    return test_integer_ops_threaded(deviceID, context, 1024 * 1024 * 2,
+    return test_integer_ops_threaded(deviceID, context, BUFFER_SIZE,
                                      { 1, 2, 3, 4, 8, 16 }, kBothVectors, num,
                                      type, testID);
 }
@@ -908,7 +910,7 @@ int run_test_compare(cl_device_id deviceID, cl_context context, cl_command_queue
 
 // Run all tests for a given type
 int run_test(cl_device_id deviceID, cl_context context, cl_command_queue queue, int num_elements, ExplicitType type, int num) {
-    return test_integer_ops_threaded(deviceID, context, 1024 * 1024 * 2,
+    return test_integer_ops_threaded(deviceID, context, BUFFER_SIZE,
                                      { 1, 2, 3, 4, 8, 16 }, kBothVectors, num,
                                      type, -1);
 }
@@ -1229,10 +1231,10 @@ int run_test_sizes(cl_device_id deviceID, cl_context context, cl_command_queue q
     }
     else
     {
-        errors += test_integer_ops_threaded(deviceID, context, num_elements,
+        errors += test_integer_ops_threaded(deviceID, context, BUFFER_SIZE,
                                             { 2, 3, 4, 8, 16 }, kInputAScalar,
                                             num, type, testID);
-        errors += test_integer_ops_threaded(deviceID, context, num_elements,
+        errors += test_integer_ops_threaded(deviceID, context, BUFFER_SIZE,
                                             { 2, 3, 4, 8, 16 }, kInputBScalar,
                                             num, type, testID);
     }

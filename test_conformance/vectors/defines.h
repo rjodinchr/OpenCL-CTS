@@ -31,7 +31,7 @@ extern const char* const g_arrVecSizeNames[NUM_VECTOR_SIZES];
 extern const size_t g_arrVecAlignMasks[NUM_VECTOR_SIZES];
 
 // Define the buffer size that we want to block our test with
-#define BUFFER_SIZE (1024 * 1024)
+#define BUFFER_SIZE (1024 * 1024 * 8)
 #define KPAGESIZE 4096
 
 extern const ExplicitType types[];
