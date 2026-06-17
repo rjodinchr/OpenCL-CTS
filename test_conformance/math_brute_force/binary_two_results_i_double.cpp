@@ -175,6 +175,7 @@ int TestFunc_DoubleI_Double_Double(const Func *f, MTdata d, bool relaxedMode)
         }
 
         // Run the kernels
+        cl_event e[VECTOR_SIZE_COUNT];
         for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
         {
             size_t vectorSize = sizeof(cl_double) * sizeValues[j];
@@ -198,6 +199,20 @@ int TestFunc_DoubleI_Double_Double(const Func *f, MTdata d, bool relaxedMode)
                                                 NULL, NULL)))
             {
                 vlog_error("FAILED -- could not execute kernel\n");
+                return error;
+            }
+            if ((error =
+                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_FALSE, 0,
+                                         BUFFER_SIZE, gOut[j], 0, NULL, NULL)))
+            {
+                vlog_error("ReadArray failed %d\n", error);
+                return error;
+            }
+            if ((error = clEnqueueReadBuffer(gQueue, gOutBuffer2[j], CL_FALSE, 0,
+                                             BUFFER_SIZE, gOut2[j], 0, NULL,
+                                             &e[j])))
+            {
+                vlog_error("ReadArray2 failed %d\n", error);
                 return error;
             }
         }
@@ -229,32 +244,23 @@ int TestFunc_DoubleI_Double_Double(const Func *f, MTdata d, bool relaxedMode)
                 r[j] = (double)f->dfunc.f_ffpI(s[j], s2[j], r2 + j);
         }
 
-        // Read the data back
-        for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-        {
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_TRUE, 0,
-                                         BUFFER_SIZE, gOut[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray failed %d\n", error);
-                return error;
-            }
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer2[j], CL_TRUE, 0,
-                                         BUFFER_SIZE, gOut2[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray2 failed %d\n", error);
-                return error;
-            }
-        }
-
         // Verify data
         uint64_t *t = (uint64_t *)gOut_Ref;
         int32_t *t2 = (int32_t *)gOut_Ref2;
-
-        for (size_t j = 0; j < BUFFER_SIZE / sizeof(double); j++)
+        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
         {
-            for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+            // Wait for the map to finish
+            if ((error = clWaitForEvents(1, e + k)))
+            {
+                vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+                return error;
+            }
+            if ((error = clReleaseEvent(e[k])))
+            {
+                vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+                return error;
+            }
+            for (size_t j = 0; j < BUFFER_SIZE / sizeof(double); j++)
             {
                 uint64_t *q = (uint64_t *)gOut[k];
                 int32_t *q2 = (int32_t *)gOut2[k];

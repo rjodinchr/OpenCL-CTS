@@ -160,6 +160,15 @@ cl_int Test(cl_uint job_id, cl_uint thread_id, void *data)
             vlog_error("FAILED -- could not execute kernel\n");
             return error;
         }
+        out[j] = (cl_int *)clEnqueueMapBuffer(
+            tinfo->tQueue, tinfo->outBuf[j], CL_FALSE, CL_MAP_READ, 0,
+            buffer_size, 0, NULL, &e[j], &error);
+        if (error || NULL == out[j])
+        {
+            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
+                       error);
+            return error;
+        }
     }
 
     // Get that moving
@@ -172,76 +181,82 @@ cl_int Test(cl_uint job_id, cl_uint thread_id, void *data)
     float *s = (float *)p;
     for (size_t j = 0; j < buffer_elements; j++) r[j] = ref_func(s[j]);
 
-    // Read the data back -- no need to wait for the first N-1 buffers but wait
-    // for the last buffer. This is an in order queue.
-    for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
+    // Verify data
+    cl_int *t = (cl_int *)r;
+
+    // If we aren't getting the correctly rounded result
+    if (gMinVectorSizeIndex == 0)
     {
-        cl_bool blocking = (j + 1 < gMaxVectorSizeIndex) ? CL_FALSE : CL_TRUE;
-        out[j] = (cl_int *)clEnqueueMapBuffer(
-            tinfo->tQueue, tinfo->outBuf[j], blocking, CL_MAP_READ, 0,
-            buffer_size, 0, NULL, NULL, &error);
-        if (error || NULL == out[j])
+        // Wait for the map to finish
+        if ((error = clWaitForEvents(1, e)))
         {
-            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
-                       error);
+            vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
             return error;
+        }
+        if ((error = clReleaseEvent(e[0])))
+        {
+            vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+            return error;
+        }
+        for (size_t j = 0; j < buffer_elements; j++)
+        {
+            cl_int *q = out[0];
+            if (t[j] == q[j]) continue;
+            // If we aren't getting the correctly rounded result
+            if (ftz || relaxedMode)
+            {
+                if (IsFloatSubnormal(s[j]))
+                {
+                    int correct = ref_func(+0.0f);
+                    int correct2 = ref_func(-0.0f);
+                    if (correct == q[j] || correct2 == q[j]) continue;
+                }
+            }
+
+            uint32_t err = t[j] - q[j];
+            if (q[j] > t[j]) err = q[j] - t[j];
+            vlog_error("\nERROR: %s: %d ulp error at %a: *%d vs. %d\n", name,
+                       err, ((float *)s)[j], t[j], q[j]);
+            return -1;
         }
     }
 
-    // Verify data
-    cl_int *t = (cl_int *)r;
-    for (size_t j = 0; j < buffer_elements; j++)
+    for (auto k = std::max(1U, gMinVectorSizeIndex); k < gMaxVectorSizeIndex;
+         k++)
     {
-        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+        // Wait for the map to finish
+        if ((error = clWaitForEvents(1, e + k)))
         {
-            cl_int *q = out[0];
-
+            vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+            return error;
+        }
+        if ((error = clReleaseEvent(e[k])))
+        {
+            vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+            return error;
+        }
+        cl_int *q = out[k];
+        for (size_t j = 0; j < buffer_elements; j++)
+        {
             // If we aren't getting the correctly rounded result
-            if (gMinVectorSizeIndex == 0 && t[j] != q[j])
+            if (-t[j] != q[j])
             {
-                // If we aren't getting the correctly rounded result
                 if (ftz || relaxedMode)
                 {
                     if (IsFloatSubnormal(s[j]))
                     {
-                        int correct = ref_func(+0.0f);
-                        int correct2 = ref_func(-0.0f);
+                        int correct = -ref_func(+0.0f);
+                        int correct2 = -ref_func(-0.0f);
                         if (correct == q[j] || correct2 == q[j]) continue;
                     }
                 }
 
-                uint32_t err = t[j] - q[j];
-                if (q[j] > t[j]) err = q[j] - t[j];
-                vlog_error("\nERROR: %s: %d ulp error at %a: *%d vs. %d\n",
-                           name, err, ((float *)s)[j], t[j], q[j]);
+                uint32_t err = -t[j] - q[j];
+                if (q[j] > -t[j]) err = q[j] + t[j];
+                vlog_error("\nERROR: %s%s: %d ulp error at %a: *%d vs. %d\n",
+                           name, sizeNames[k], err, ((float *)s)[j], -t[j],
+                           q[j]);
                 return -1;
-            }
-
-
-            for (auto k = std::max(1U, gMinVectorSizeIndex);
-                 k < gMaxVectorSizeIndex; k++)
-            {
-                q = out[k];
-                // If we aren't getting the correctly rounded result
-                if (-t[j] != q[j])
-                {
-                    if (ftz || relaxedMode)
-                    {
-                        if (IsFloatSubnormal(s[j]))
-                        {
-                            int correct = -ref_func(+0.0f);
-                            int correct2 = -ref_func(-0.0f);
-                            if (correct == q[j] || correct2 == q[j]) continue;
-                        }
-                    }
-
-                    uint32_t err = -t[j] - q[j];
-                    if (q[j] > -t[j]) err = q[j] + t[j];
-                    vlog_error(
-                        "\nERROR: %s%s: %d ulp error at %a: *%d vs. %d\n", name,
-                        sizeNames[k], err, ((float *)s)[j], -t[j], q[j]);
-                    return -1;
-                }
             }
         }
     }

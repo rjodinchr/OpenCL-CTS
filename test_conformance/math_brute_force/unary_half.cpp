@@ -158,6 +158,15 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
             vlog_error("FAILED -- could not execute kernel\n");
             return error;
         }
+        out[j] = (uint16_t *)clEnqueueMapBuffer(
+            tinfo->tQueue, tinfo->outBuf[j], CL_FALSE, CL_MAP_READ, 0,
+            buffer_size, 0, NULL, &e[j], &error);
+        if (error || NULL == out[j])
+        {
+            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
+                       error);
+            return error;
+        }
     }
 
 
@@ -175,37 +184,23 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
         r[j] = HFF(func.f_f(s[j]));
     }
 
-    // Read the data back -- no need to wait for the first N-1 buffers. This is
-    // an in order queue.
-    for (j = gMinVectorSizeIndex; j + 1 < gMaxVectorSizeIndex; j++)
+    // Verify data
+    for (k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
     {
-        out[j] = (uint16_t *)clEnqueueMapBuffer(
-            tinfo->tQueue, tinfo->outBuf[j], CL_FALSE, CL_MAP_READ, 0,
-            buffer_size, 0, NULL, NULL, &error);
-        if (error || NULL == out[j])
+        // Wait for the map to finish
+        if ((error = clWaitForEvents(1, e + k)))
         {
-            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
-                       error);
+            vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
             return error;
         }
-    }
-    // Wait for the last buffer
-    out[j] = (uint16_t *)clEnqueueMapBuffer(tinfo->tQueue, tinfo->outBuf[j],
-                                            CL_TRUE, CL_MAP_READ, 0,
-                                            buffer_size, 0, NULL, NULL, &error);
-    if (error || NULL == out[j])
-    {
-        vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j, error);
-        return error;
-    }
-
-    // Verify data
-    for (j = 0; j < buffer_elements; j++)
-    {
-        for (k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+        if ((error = clReleaseEvent(e[k])))
         {
-            cl_ushort *q = out[k];
-
+            vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+            return error;
+        }
+        cl_ushort *q = out[k];
+        for (j = 0; j < buffer_elements; j++)
+        {
             // If we aren't getting the correctly rounded result
             if (r[j] != q[j])
             {

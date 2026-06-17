@@ -175,6 +175,15 @@ cl_int Test(cl_uint job_id, cl_uint thread_id, void *data)
             vlog_error("FAILED -- could not execute kernel\n");
             return error;
         }
+        out[j] = (cl_ulong *)clEnqueueMapBuffer(
+            tinfo->tQueue, tinfo->outBuf[j], CL_FALSE, CL_MAP_READ, 0,
+            buffer_size, 0, NULL, &e[j], &error);
+        if (error || NULL == out[j])
+        {
+            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
+                       error);
+            return error;
+        }
     }
 
     // Get that moving
@@ -189,27 +198,22 @@ cl_int Test(cl_uint job_id, cl_uint thread_id, void *data)
     for (size_t j = 0; j < buffer_elements; j++)
         r[j] = (cl_double)func.f_ff(s[j], s2[j]);
 
-    // Read the data back -- no need to wait for the first N-1 buffers but wait
-    // for the last buffer. This is an in order queue.
-    for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-    {
-        cl_bool blocking = (j + 1 < gMaxVectorSizeIndex) ? CL_FALSE : CL_TRUE;
-        out[j] = (cl_ulong *)clEnqueueMapBuffer(
-            tinfo->tQueue, tinfo->outBuf[j], blocking, CL_MAP_READ, 0,
-            buffer_size, 0, NULL, NULL, &error);
-        if (error || NULL == out[j])
-        {
-            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
-                       error);
-            return error;
-        }
-    }
-
     // Verify data
     t = (cl_ulong *)r;
-    for (size_t j = 0; j < buffer_elements; j++)
+    for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
     {
-        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+        // Wait for the map to finish
+        if ((error = clWaitForEvents(1, e + k)))
+        {
+            vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+            return error;
+        }
+        if ((error = clReleaseEvent(e[k])))
+        {
+            vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+            return error;
+        }
+        for (size_t j = 0; j < buffer_elements; j++)
         {
             cl_ulong *q = out[k];
 

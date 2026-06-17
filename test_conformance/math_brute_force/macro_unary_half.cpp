@@ -154,6 +154,15 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
             vlog_error("FAILED -- could not execute kernel\n");
             return error;
         }
+        out[j] = (cl_short *)clEnqueueMapBuffer(
+            tinfo->tQueue, tinfo->outBuf[j], CL_FALSE, CL_MAP_READ, 0,
+            buffer_size, 0, NULL, &e[j], &error);
+        if (error || NULL == out[j])
+        {
+            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
+                       error);
+            return error;
+        }
     }
 
 
@@ -181,38 +190,24 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
             r[j] = (short)ref_func(s[j]);
     }
 
-    // Read the data back -- no need to wait for the first N-1 buffers. This is
-    // an in order queue.
-    for (j = gMinVectorSizeIndex; j + 1 < gMaxVectorSizeIndex; j++)
+    // If we aren't getting the correctly rounded result
+    if (gMinVectorSizeIndex == 0)
     {
-        out[j] = (cl_short *)clEnqueueMapBuffer(
-            tinfo->tQueue, tinfo->outBuf[j], CL_FALSE, CL_MAP_READ, 0,
-            buffer_size, 0, NULL, NULL, &error);
-        if (error || NULL == out[j])
+        // Wait for the map to finish
+        if ((error = clWaitForEvents(1, e)))
         {
-            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
-                       error);
+            vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
             return error;
         }
-    }
-    // Wait for the last buffer
-    out[j] = (cl_short *)clEnqueueMapBuffer(tinfo->tQueue, tinfo->outBuf[j],
-                                            CL_TRUE, CL_MAP_READ, 0,
-                                            buffer_size, 0, NULL, NULL, &error);
-    if (error || NULL == out[j])
-    {
-        vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j, error);
-        return error;
-    }
-
-    // Verify data
-    for (j = 0; j < buffer_elements; j++)
-    {
-        cl_short *q = out[0];
-
-        // If we aren't getting the correctly rounded result
-        if (gMinVectorSizeIndex == 0 && t[j] != q[j])
+        if ((error = clReleaseEvent(e[0])))
         {
+            vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+            return error;
+        }
+        cl_short *q = out[0];
+        for (j = 0; j < buffer_elements; j++)
+        {
+            if (t[j] == q[j]) continue;
             // If we aren't getting the correctly rounded result
             if (ftz)
             {
@@ -232,12 +227,23 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
             error = -1;
             return error;
         }
-
-
-        for (k = std::max(1U, gMinVectorSizeIndex); k < gMaxVectorSizeIndex;
-             k++)
+    }
+    for (k = std::max(1U, gMinVectorSizeIndex); k < gMaxVectorSizeIndex; k++)
+    {
+        // Wait for the map to finish
+        if ((error = clWaitForEvents(1, e + k)))
         {
-            q = out[k];
+            vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+            return error;
+        }
+        if ((error = clReleaseEvent(e[k])))
+        {
+            vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+            return error;
+        }
+        cl_short *q = out[k];
+        for (j = 0; j < buffer_elements; j++)
+        {
             // If we aren't getting the correctly rounded result
             if (-t[j] != q[j])
             {
