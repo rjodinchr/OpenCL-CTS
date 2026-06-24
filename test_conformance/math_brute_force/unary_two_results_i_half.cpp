@@ -56,14 +56,9 @@ int TestFunc_HalfI_Half(const Func *f, MTdata d, bool relaxedMode)
     int ftz = f->ftz || gForceFTZ || 0 == (CL_FP_DENORM & gHalfCapabilities);
     float maxErrorVal = 0.0f;
     float maxErrorVal2 = 0.0f;
-    uint64_t step = getTestStep(sizeof(cl_half), BUFFER_SIZE);
+    uint64_t step = getTestStep(sizeof(cl_int), BUFFER_SIZE);
 
-    // sizeof(cl_half) < sizeof (int32_t)
-    // to prevent overflowing gOut_Ref2 it is necessary to use
-    // bigger type as denominator for buffer size calculation
-    size_t bufferElements = std::min(BUFFER_SIZE / sizeof(cl_int),
-                                     size_t(1ULL << (sizeof(cl_half) * 8)));
-
+    size_t bufferElements = step;
     size_t bufferSizeLo = bufferElements * sizeof(cl_half);
     size_t bufferSizeHi = bufferElements * sizeof(cl_int);
 
@@ -88,7 +83,7 @@ int TestFunc_HalfI_Half(const Func *f, MTdata d, bool relaxedMode)
 
         // Init input array
         cl_half *pIn = (cl_half *)gIn;
-        for (size_t j = 0; j < bufferElements; j++) pIn[j] = (cl_ushort)i + j;
+        fillHalfUnaryInput(pIn, step, i, d, true);
 
         if ((error = clEnqueueWriteBuffer(gQueue, gInBuffer, CL_FALSE, 0,
                                           bufferSizeLo, gIn, 0, NULL, NULL)))
@@ -140,6 +135,7 @@ int TestFunc_HalfI_Half(const Func *f, MTdata d, bool relaxedMode)
         }
 
         // Run the kernels
+        cl_event e[VECTOR_SIZE_COUNT];
         for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
         {
             // align working group size with the bigger output type
@@ -162,6 +158,20 @@ int TestFunc_HalfI_Half(const Func *f, MTdata d, bool relaxedMode)
                 vlog_error("FAILED -- could not execute kernel\n");
                 return error;
             }
+            if ((error =
+                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_FALSE, 0,
+                                         bufferSizeLo, gOut[j], 0, NULL, NULL)))
+            {
+                vlog_error("ReadArray failed %d\n", error);
+                return error;
+            }
+            if ((error = clEnqueueReadBuffer(gQueue, gOutBuffer2[j], CL_FALSE,
+                                             0, bufferSizeHi, gOut2[j], 0, NULL,
+                                             &e[j])))
+            {
+                vlog_error("ReadArray2 failed %d\n", error);
+                return error;
+            }
         }
 
         // Get that moving
@@ -177,35 +187,24 @@ int TestFunc_HalfI_Half(const Func *f, MTdata d, bool relaxedMode)
         for (size_t j = 0; j < bufferElements; j++)
             ref1[j] = HFF((float)f->func.f_fpI(HTF(pIn[j]), ref2 + j));
 
-        // Read the data back
-        for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-        {
-            cl_bool blocking =
-                (j + 1 < gMaxVectorSizeIndex) ? CL_FALSE : CL_TRUE;
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], blocking, 0,
-                                         bufferSizeLo, gOut[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray failed %d\n", error);
-                return error;
-            }
-            if ((error = clEnqueueReadBuffer(gQueue, gOutBuffer2[j], blocking,
-                                             0, bufferSizeHi, gOut2[j], 0, NULL,
-                                             NULL)))
-            {
-                vlog_error("ReadArray2 failed %d\n", error);
-                return error;
-            }
-        }
-
         // Verify data
-        for (size_t j = 0; j < bufferElements; j++)
+        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
         {
-            for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+            // Wait for the map to finish
+            if ((error = clWaitForEvents(1, e + k)))
             {
-                cl_half *test1 = (cl_half *)(gOut[k]);
-                int32_t *test2 = (int32_t *)(gOut2[k]);
-
+                vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+                return error;
+            }
+            if ((error = clReleaseEvent(e[k])))
+            {
+                vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+                return error;
+            }
+            cl_half *test1 = (cl_half *)(gOut[k]);
+            int32_t *test2 = (int32_t *)(gOut2[k]);
+            for (size_t j = 0; j < bufferElements; j++)
+            {
                 // If we aren't getting the correctly rounded result
                 if (ref1[j] != test1[j] || ref2[j] != test2[j])
                 {

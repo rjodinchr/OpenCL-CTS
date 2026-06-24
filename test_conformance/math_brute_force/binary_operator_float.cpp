@@ -53,7 +53,7 @@ cl_int Test(cl_uint job_id, cl_uint thread_id, void *data)
     TestInfo *job = (TestInfo *)data;
     size_t buffer_elements = job->subBufferSize;
     size_t buffer_size = buffer_elements * sizeof(cl_float);
-    cl_uint base = job_id * (cl_uint)job->step;
+    cl_uint base = job_id * (cl_uint)buffer_elements;
     ThreadInfoBinary *tinfo = &(job->tinfo[thread_id]);
     fptr func = job->f->func;
     int ftz = job->ftz;
@@ -99,50 +99,11 @@ cl_int Test(cl_uint job_id, cl_uint thread_id, void *data)
     // Init input array
     cl_uint *p = (cl_uint *)gIn + thread_id * buffer_elements;
     cl_uint *p2 = (cl_uint *)gIn2 + thread_id * buffer_elements;
-    cl_uint idx = 0;
-
-    const std::vector<float> &specialValues = getFloatSpecialValues();
-    size_t specialValuesCount = specialValues.size();
-    int totalSpecialValueCount = specialValuesCount * specialValuesCount;
-    int lastSpecialJobIndex = (totalSpecialValueCount - 1) / buffer_elements;
-
-    if (job_id <= (cl_uint)lastSpecialJobIndex)
+    fillFloatBinaryInput((cl_float *)p, (cl_float *)p2, buffer_elements, base,
+                         d);
+    if (relaxedMode && strcmp(name, "divide") == 0)
     {
-        // Insert special values
-        uint32_t x, y;
-
-        x = (job_id * buffer_elements) % specialValuesCount;
-        y = (job_id * buffer_elements) / specialValuesCount;
-
-        for (; idx < buffer_elements; idx++)
-        {
-            p[idx] = ((cl_uint *)specialValues.data())[x];
-            p2[idx] = ((cl_uint *)specialValues.data())[y];
-            ++x;
-            if (x >= specialValuesCount)
-            {
-                x = 0;
-                y++;
-                if (y >= specialValuesCount) break;
-            }
-            if (relaxedMode && strcmp(name, "divide") == 0)
-            {
-                cl_uint pj = p[idx] & 0x7fffffff;
-                cl_uint p2j = p2[idx] & 0x7fffffff;
-                // Replace values outside [2^-62, 2^62] with QNaN
-                if (pj < 0x20800000 || pj > 0x5e800000) p[idx] = 0x7fc00000;
-                if (p2j < 0x20800000 || p2j > 0x5e800000) p2[idx] = 0x7fc00000;
-            }
-        }
-    }
-
-    // Init any remaining values
-    for (; idx < buffer_elements; idx++)
-    {
-        p[idx] = genrand_int32(d);
-        p2[idx] = genrand_int32(d);
-
-        if (relaxedMode && strcmp(name, "divide") == 0)
+        for (cl_uint idx = 0; idx < buffer_elements; idx++)
         {
             cl_uint pj = p[idx] & 0x7fffffff;
             cl_uint p2j = p2[idx] & 0x7fffffff;
@@ -230,6 +191,15 @@ cl_int Test(cl_uint job_id, cl_uint thread_id, void *data)
             vlog_error("FAILED -- could not execute kernel\n");
             return error;
         }
+        out[j] = (cl_uint *)clEnqueueMapBuffer(
+            tinfo->tQueue, tinfo->outBuf[j], CL_FALSE, CL_MAP_READ, 0,
+            buffer_size, 0, NULL, &e[j], &error);
+        if (error || NULL == out[j])
+        {
+            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
+                       error);
+            return error;
+        }
     }
 
     // Get that moving
@@ -273,27 +243,22 @@ cl_int Test(cl_uint job_id, cl_uint thread_id, void *data)
 
     if (ftz || relaxedMode) RestoreFPState(&oldMode);
 
-    // Read the data back -- no need to wait for the first N-1 buffers but wait
-    // for the last buffer. This is an in order queue.
-    for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-    {
-        cl_bool blocking = (j + 1 < gMaxVectorSizeIndex) ? CL_FALSE : CL_TRUE;
-        out[j] = (cl_uint *)clEnqueueMapBuffer(
-            tinfo->tQueue, tinfo->outBuf[j], blocking, CL_MAP_READ, 0,
-            buffer_size, 0, NULL, NULL, &error);
-        if (error || NULL == out[j])
-        {
-            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
-                       error);
-            return error;
-        }
-    }
-
     // Verify data
     t = (cl_uint *)r;
-    for (size_t j = 0; j < buffer_elements; j++)
+    for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
     {
-        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+        // Wait for the map to finish
+        if ((error = clWaitForEvents(1, e + k)))
+        {
+            vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+            return error;
+        }
+        if ((error = clReleaseEvent(e[k])))
+        {
+            vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+            return error;
+        }
+        for (size_t j = 0; j < buffer_elements; j++)
         {
             cl_uint *q = out[k];
 
@@ -515,10 +480,9 @@ cl_int Test(cl_uint job_id, cl_uint thread_id, void *data)
     {
         if (gVerboseBruteForce)
         {
-            vlog("base:%14u step:%10u scale:%10u buf_elements:%10zu ulps:%5.3f "
+            vlog("base:%14u buf_elements:%10zu ulps:%5.3f "
                  "ThreadCount:%2u\n",
-                 base, job->step, job->scale, buffer_elements, job->ulps,
-                 job->threadCount);
+                 base, buffer_elements, job->ulps, job->threadCount);
         }
         else
         {
@@ -547,18 +511,8 @@ int TestFunc_Float_Float_Float_Operator(const Func *f, MTdata d,
     test_info.threadCount = GetThreadCount();
     test_info.subBufferSize = BUFFER_SIZE
         / (sizeof(cl_float) * RoundUpToNextPowerOfTwo(test_info.threadCount));
-    test_info.scale = getTestScale(sizeof(cl_float));
-
-    test_info.step = (cl_uint)test_info.subBufferSize * test_info.scale;
-    if (test_info.step / test_info.subBufferSize != test_info.scale)
-    {
-        // there was overflow
-        test_info.jobCount = 1;
-    }
-    else
-    {
-        test_info.jobCount = (cl_uint)((1ULL << 32) / test_info.step);
-    }
+    test_info.jobCount = std::max(
+        (cl_uint)1, (cl_uint)(getInputCount() / test_info.subBufferSize));
 
     test_info.f = f;
     test_info.ulps = gIsEmbedded ? f->float_embedded_ulps : f->float_ulps;

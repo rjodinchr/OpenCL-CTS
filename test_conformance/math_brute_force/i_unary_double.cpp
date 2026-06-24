@@ -45,8 +45,6 @@ int TestFunc_Int_Double(const Func *f, MTdata d, bool relaxedMode)
     KernelMatrix kernels;
     int ftz = f->ftz || gForceFTZ;
     uint64_t step = getTestStep(sizeof(cl_double), BUFFER_SIZE);
-    int scale =
-        (int)((1ULL << 32) / (16 * BUFFER_SIZE / sizeof(cl_double)) + 1);
 
     logFunctionInfo(f->name, sizeof(cl_double), relaxedMode);
 
@@ -62,22 +60,12 @@ int TestFunc_Int_Double(const Func *f, MTdata d, bool relaxedMode)
             return error;
     }
 
-    for (uint64_t i = 0; i < (1ULL << 32); i += step)
+    for (uint64_t i = 0; i < getInputCount(); i += step)
     {
         if (gSkipCorrectnessTesting) break;
 
         // Init input array
-        double *p = (double *)gIn;
-        if (gWimpyMode)
-        {
-            for (size_t j = 0; j < BUFFER_SIZE / sizeof(cl_double); j++)
-                p[j] = DoubleFromUInt32((uint32_t)i + j * scale);
-        }
-        else
-        {
-            for (size_t j = 0; j < BUFFER_SIZE / sizeof(cl_double); j++)
-                p[j] = DoubleFromUInt32((uint32_t)i + j);
-        }
+        fillDoubleUnaryInput((double *)gIn, step, i, d);
 
         if ((error = clEnqueueWriteBuffer(gQueue, gInBuffer, CL_FALSE, 0,
                                           BUFFER_SIZE, gIn, 0, NULL, NULL)))
@@ -117,6 +105,7 @@ int TestFunc_Int_Double(const Func *f, MTdata d, bool relaxedMode)
         }
 
         // Run the kernels
+        cl_event e[VECTOR_SIZE_COUNT];
         for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
         {
             size_t vectorSize = sizeValues[j] * sizeof(cl_double);
@@ -136,6 +125,13 @@ int TestFunc_Int_Double(const Func *f, MTdata d, bool relaxedMode)
                 vlog_error("FAILED -- could not execute kernel\n");
                 return error;
             }
+            if ((error =
+                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_FALSE, 0,
+                                         BUFFER_SIZE, gOut[j], 0, NULL, &e[j])))
+            {
+                vlog_error("ReadArray failed %d\n", error);
+                return error;
+            }
         }
 
         // Get that moving
@@ -147,23 +143,22 @@ int TestFunc_Int_Double(const Func *f, MTdata d, bool relaxedMode)
         for (size_t j = 0; j < BUFFER_SIZE / sizeof(cl_double); j++)
             r[j] = f->dfunc.i_f(s[j]);
 
-        // Read the data back
-        for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-        {
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_TRUE, 0,
-                                         BUFFER_SIZE, gOut[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray failed %d\n", error);
-                return error;
-            }
-        }
-
         // Verify data
         uint32_t *t = (uint32_t *)gOut_Ref;
-        for (size_t j = 0; j < BUFFER_SIZE / sizeof(cl_double); j++)
+        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
         {
-            for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+            // Wait for the map to finish
+            if ((error = clWaitForEvents(1, e + k)))
+            {
+                vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+                return error;
+            }
+            if ((error = clReleaseEvent(e[k])))
+            {
+                vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+                return error;
+            }
+            for (size_t j = 0; j < BUFFER_SIZE / sizeof(cl_double); j++)
             {
                 uint32_t *q = (uint32_t *)(gOut[k]);
                 // If we aren't getting the correctly rounded result

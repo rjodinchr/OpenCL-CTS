@@ -51,9 +51,8 @@ int TestFunc_Half2_Half(const Func *f, MTdata d, bool relaxedMode)
     float maxErrorVal1 = 0.0f;
     uint64_t step = getTestStep(sizeof(cl_half), BUFFER_SIZE);
 
-    size_t bufferElements = std::min(BUFFER_SIZE / sizeof(cl_half),
-                                     size_t(1ULL << (sizeof(cl_half) * 8)));
-    size_t bufferSize = bufferElements * sizeof(cl_half);
+    size_t bufferElements = step;
+    size_t bufferSize = BUFFER_SIZE;
 
     std::vector<cl_uchar> overflow(bufferElements);
     int isFract = 0 == strcmp("fract", f->nameInCode);
@@ -76,7 +75,7 @@ int TestFunc_Half2_Half(const Func *f, MTdata d, bool relaxedMode)
 
         // Init input array
         cl_half *pIn = (cl_half *)gIn;
-        for (size_t j = 0; j < bufferElements; j++) pIn[j] = (cl_ushort)i + j;
+        fillHalfUnaryInput(pIn, step, i, d, true);
 
         if ((error = clEnqueueWriteBuffer(gQueue, gInBuffer, CL_FALSE, 0,
                                           bufferSize, gIn, 0, NULL, NULL)))
@@ -128,6 +127,7 @@ int TestFunc_Half2_Half(const Func *f, MTdata d, bool relaxedMode)
         }
 
         // Run the kernels
+        cl_event e[VECTOR_SIZE_COUNT];
         for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
         {
             size_t vectorSize = sizeValues[j] * sizeof(cl_half);
@@ -147,6 +147,20 @@ int TestFunc_Half2_Half(const Func *f, MTdata d, bool relaxedMode)
                                                 NULL, NULL)))
             {
                 vlog_error("FAILED -- could not execute kernel\n");
+                return error;
+            }
+            if ((error =
+                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_FALSE, 0,
+                                         bufferSize, gOut[j], 0, NULL, NULL)))
+            {
+                vlog_error("ReadArray failed %d\n", error);
+                return error;
+            }
+            if ((error =
+                     clEnqueueReadBuffer(gQueue, gOutBuffer2[j], CL_FALSE, 0,
+                                         bufferSize, gOut2[j], 0, NULL, &e[j])))
+            {
+                vlog_error("ReadArray2 failed %d\n", error);
                 return error;
             }
         }
@@ -204,33 +218,24 @@ int TestFunc_Half2_Half(const Func *f, MTdata d, bool relaxedMode)
 
         if (isFract && ftz) RestoreFPState(&oldMode);
 
-        // Read the data back
-        for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-        {
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_TRUE, 0,
-                                         bufferSize, gOut[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray failed %d\n", error);
-                return error;
-            }
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer2[j], CL_TRUE, 0,
-                                         bufferSize, gOut2[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray2 failed %d\n", error);
-                return error;
-            }
-        }
-
         // Verify data
-        for (size_t j = 0; j < bufferElements; j++)
+        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
         {
-            for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+            // Wait for the map to finish
+            if ((error = clWaitForEvents(1, e + k)))
             {
-                cl_half *test1 = (cl_half *)gOut[k];
-                cl_half *test2 = (cl_half *)gOut2[k];
-
+                vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+                return error;
+            }
+            if ((error = clReleaseEvent(e[k])))
+            {
+                vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+                return error;
+            }
+            cl_half *test1 = (cl_half *)gOut[k];
+            cl_half *test2 = (cl_half *)gOut2[k];
+            for (size_t j = 0; j < bufferElements; j++)
+            {
                 // If we aren't getting the correctly rounded result
                 if (ref1[j] != test1[j] || ref2[j] != test2[j])
                 {

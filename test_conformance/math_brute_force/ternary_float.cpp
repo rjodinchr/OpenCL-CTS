@@ -75,51 +75,13 @@ int TestFunc_Float_Float_Float_Float(const Func *f, MTdata d, bool relaxedMode)
                                &build_info)))
         return error;
 
-    const std::vector<float> &specialValues = getFloatSpecialValues();
-    size_t specialValuesCount = specialValues.size();
-    for (uint64_t i = 0; i < (1ULL << 32); i += step)
+    for (uint64_t i = 0; i < getInputCount(); i += step)
     {
         if (gSkipCorrectnessTesting) break;
 
         // Init input array
-        cl_uint *p = (cl_uint *)gIn;
-        cl_uint *p2 = (cl_uint *)gIn2;
-        cl_uint *p3 = (cl_uint *)gIn3;
-        size_t idx = 0;
-
-        if (i == 0)
-        { // test edge cases
-            float *fp = (float *)gIn;
-            float *fp2 = (float *)gIn2;
-            float *fp3 = (float *)gIn3;
-            uint32_t x, y, z;
-            x = y = z = 0;
-            for (; idx < BUFFER_SIZE / sizeof(float); idx++)
-            {
-                fp[idx] = specialValues[x];
-                fp2[idx] = specialValues[y];
-                fp3[idx] = specialValues[z];
-
-                if (++x >= specialValuesCount)
-                {
-                    x = 0;
-                    if (++y >= specialValuesCount)
-                    {
-                        y = 0;
-                        if (++z >= specialValuesCount) break;
-                    }
-                }
-            }
-            if (idx == BUFFER_SIZE / sizeof(float))
-                vlog_error("Test Error: not all special cases tested!\n");
-        }
-
-        for (; idx < BUFFER_SIZE / sizeof(float); idx++)
-        {
-            p[idx] = genrand_int32(d);
-            p2[idx] = genrand_int32(d);
-            p3[idx] = genrand_int32(d);
-        }
+        fillFloatTernaryInput((float *)gIn, (float *)gIn2, (float *)gIn3, step,
+                              i, d);
 
         if ((error = clEnqueueWriteBuffer(gQueue, gInBuffer, CL_FALSE, 0,
                                           BUFFER_SIZE, gIn, 0, NULL, NULL)))
@@ -173,6 +135,7 @@ int TestFunc_Float_Float_Float_Float(const Func *f, MTdata d, bool relaxedMode)
         }
 
         // Run the kernels
+        cl_event e[VECTOR_SIZE_COUNT];
         for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
         {
             size_t vectorSize = sizeof(cl_float) * sizeValues[j];
@@ -196,6 +159,13 @@ int TestFunc_Float_Float_Float_Float(const Func *f, MTdata d, bool relaxedMode)
                                                 NULL, NULL)))
             {
                 vlog_error("FAILED -- could not execute kernel\n");
+                return error;
+            }
+            if ((error =
+                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_FALSE, 0,
+                                         BUFFER_SIZE, gOut[j], 0, NULL, &e[j])))
+            {
+                vlog_error("ReadArray failed %d\n", error);
                 return error;
             }
         }
@@ -226,26 +196,24 @@ int TestFunc_Float_Float_Float_Float(const Func *f, MTdata d, bool relaxedMode)
                     (float)f->func.f_fma(s[j], s2[j], s3[j], CORRECTLY_ROUNDED);
         }
 
-        // Read the data back
-        for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-        {
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_TRUE, 0,
-                                         BUFFER_SIZE, gOut[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray failed %d\n", error);
-                return error;
-            }
-        }
-
         // Verify data
         uint32_t *t = (uint32_t *)gOut_Ref;
-        for (size_t j = 0; j < BUFFER_SIZE / sizeof(float); j++)
+        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
         {
-            for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+            // Wait for the map to finish
+            if ((error = clWaitForEvents(1, e + k)))
             {
-                uint32_t *q = (uint32_t *)(gOut[k]);
-
+                vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+                return error;
+            }
+            if ((error = clReleaseEvent(e[k])))
+            {
+                vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+                return error;
+            }
+            uint32_t *q = (uint32_t *)(gOut[k]);
+            for (size_t j = 0; j < BUFFER_SIZE / sizeof(float); j++)
+            {
                 // If we aren't getting the correctly rounded result
                 if (t[j] != q[j])
                 {

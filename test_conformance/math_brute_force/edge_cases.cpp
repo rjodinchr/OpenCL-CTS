@@ -829,6 +829,7 @@ REGISTER_TEST(math_edge_cases)
         log_info("Skipping math_edge_cases test\n");
         return TEST_SKIPPED_ITSELF;
     }
+    ResourceGuard guard;
     EdgeCasesTest edge_cases_test;
     return edge_cases_test.run_edge_cases(
         edge_case_table, sizeof(edge_case_table) / sizeof((edge_case_table)[0]),

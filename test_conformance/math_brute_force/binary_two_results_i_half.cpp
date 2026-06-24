@@ -102,18 +102,14 @@ int TestFunc_HalfI_Half_Half(const Func *f, MTdata d, bool relaxedMode)
                                &build_info)))
         return error;
 
-    for (uint64_t i = 0; i < (1ULL << 32); i += step)
+    for (uint64_t i = 0; i < getInputCount(); i += step)
     {
         if (gSkipCorrectnessTesting) break;
 
         // Init input array
         cl_half *p = (cl_half *)gIn;
         cl_half *p2 = (cl_half *)gIn2;
-        for (size_t j = 0; j < buffer_size; j++)
-        {
-            p[j] = (cl_half)genrand_int32(d);
-            p2[j] = (cl_half)genrand_int32(d);
-        }
+        fillHalfBinaryInput(p, p2, step, i, d);
 
         if ((error = clEnqueueWriteBuffer(gQueue, gInBuffer, CL_FALSE, 0,
                                           buffer_size * sizeof(cl_half), gIn, 0,
@@ -174,6 +170,7 @@ int TestFunc_HalfI_Half_Half(const Func *f, MTdata d, bool relaxedMode)
         }
 
         // Run the kernels
+        cl_event e[VECTOR_SIZE_COUNT];
         for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
         {
             // align working group size with the bigger output type
@@ -197,6 +194,20 @@ int TestFunc_HalfI_Half_Half(const Func *f, MTdata d, bool relaxedMode)
                                                 NULL, NULL)))
             {
                 vlog_error("FAILED -- could not execute kernel\n");
+                return error;
+            }
+            if ((error =
+                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_FALSE, 0,
+                                         BUFFER_SIZE, gOut[j], 0, NULL, NULL)))
+            {
+                vlog_error("ReadArray failed %d\n", error);
+                return error;
+            }
+            if ((error = clEnqueueReadBuffer(gQueue, gOutBuffer2[j], CL_FALSE,
+                                             0, BUFFER_SIZE, gOut2[j], 0, NULL,
+                                             &e[j])))
+            {
+                vlog_error("ReadArray2 failed %d\n", error);
                 return error;
             }
         }
@@ -225,33 +236,23 @@ int TestFunc_HalfI_Half_Half(const Func *f, MTdata d, bool relaxedMode)
                     HFF((float)f->func.f_ffpI(HTF(p[j]), HTF(p2[j]), r2 + j));
         }
 
-        // Read the data back
-        for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-        {
-            cl_bool blocking =
-                (j + 1 < gMaxVectorSizeIndex) ? CL_FALSE : CL_TRUE;
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], blocking, 0,
-                                         BUFFER_SIZE, gOut[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray failed %d\n", error);
-                return error;
-            }
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer2[j], blocking, 0,
-                                         BUFFER_SIZE, gOut2[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray2 failed %d\n", error);
-                return error;
-            }
-        }
-
         // Verify data
         cl_half *t = (cl_half *)gOut_Ref;
         int32_t *t2 = (int32_t *)gOut_Ref2;
-        for (size_t j = 0; j < buffer_size; j++)
+        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
         {
-            for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+            // Wait for the map to finish
+            if ((error = clWaitForEvents(1, e + k)))
+            {
+                vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+                return error;
+            }
+            if ((error = clReleaseEvent(e[k])))
+            {
+                vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+                return error;
+            }
+            for (size_t j = 0; j < buffer_size; j++)
             {
                 cl_half *q = (cl_half *)(gOut[k]);
                 int32_t *q2 = (int32_t *)gOut2[k];
