@@ -13,18 +13,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
+#include "mt19937.h"
 #include "testBase.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
 #include <cinttypes>
+#include <limits>
+#include <mutex>
+#include <type_traits>
+#include <vector>
 
 #include "harness/conversions.h"
+#include "harness/parseParameters.h"
+
+static std::recursive_mutex gLock;
 
 extern     MTdata          d;
+#define MASK(n) ((1 << (n)) - 1)
 
 // The tests we are running
 const char *tests[] = {
@@ -80,146 +90,153 @@ const char *test_names[] = {
     "!",  // 22
 };
 
-// =======================================
-// long
-// =======================================
-int
-verify_long(int test, size_t vector_size, cl_long *inptrA, cl_long *inptrB, cl_long *outptr, size_t n)
+template <typename T> struct VerifyInput
 {
-    cl_long            r, shift_mask = (sizeof(cl_long)*8)-1;
-    size_t         i, j;
-    int count=0;
+    const T *ptr;
+    bool is_scalar;
+    size_t vector_size;
 
-    for (j=0; j<n; j += vector_size )
+    VerifyInput(const T *p, bool is_s, size_t v)
+        : ptr(p), is_scalar(is_s), vector_size(v)
+    {}
+
+    T operator[](size_t idx) const
     {
-        for( i = j; i < j + vector_size; i++ )
+        return is_scalar ? ptr[idx / vector_size] : ptr[idx];
+    }
+};
+
+#define WRAP_INPUTS(type)                                                      \
+    VerifyInput<type> inptrA(inptrA_raw, a_scalar, vector_size);               \
+    VerifyInput<type> inptrB(inptrB_raw, b_scalar, vector_size)
+
+template <typename T> bool is_valid_div(T a, T b)
+{
+    if (b == 0) return false;
+    if (std::is_signed<T>::value)
+    {
+        if (b == (T)-1 && a == std::numeric_limits<T>::min())
         {
-            switch (test) {
-                case 0:
-                    r = inptrA[i] + inptrB[i];
-                    break;
-                case 1:
-                    r = inptrA[i] - inptrB[i];
-                    break;
-                case 2:
-                    r = inptrA[i] * inptrB[i];
-                    break;
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename T>
+static void compute_references(int test, size_t vector_size,
+                               const VerifyInput<T> &inptrA,
+                               const VerifyInput<T> &inptrB, const T *outptr,
+                               T *ref, size_t n, cl_uint shift_mask)
+{
+    for (size_t j = 0; j < n; j += vector_size)
+    {
+        for (size_t i = j; i < j + vector_size; i++)
+        {
+            T r = 0;
+            switch (test)
+            {
+                case 0: r = inptrA[i] + inptrB[i]; break;
+                case 1: r = inptrA[i] - inptrB[i]; break;
+                case 2: r = inptrA[i] * inptrB[i]; break;
                 case 3:
-                    if (inptrB[i] == 0 || (inptrB[i] == -1 && inptrA[i] == CL_LONG_MIN))
-                        continue;
+                    if (!is_valid_div<T>(inptrA[i], inptrB[i]))
+                        r = outptr[i];
                     else
                         r = inptrA[i] / inptrB[i];
                     break;
                 case 4:
-                    if (inptrB[i] == 0 || (inptrB[i] == -1 && inptrA[i] == CL_LONG_MIN))
-                        continue;
+                    if (!is_valid_div<T>(inptrA[i], inptrB[i]))
+                        r = outptr[i];
                     else
                         r = inptrA[i] % inptrB[i];
                     break;
-                case 5:
-                    r = inptrA[i] & inptrB[i];
-                    break;
-                case 6:
-                    r = inptrA[i] | inptrB[i];
-                    break;
-                case 7:
-                    r = inptrA[i] ^ inptrB[i];
-                    break;
-                case 8:
-                    r = inptrA[i] >> (inptrB[i] & shift_mask);
-                    break;
-                case 9:
-                    r = inptrA[i] << (inptrB[i] & shift_mask);
-                    break;
-                case 10:
-                    r = inptrA[i] >> (inptrB[j] & shift_mask);
-                    break;
-                case 11:
-                    r = inptrA[i] << (inptrB[j] & shift_mask);
-                    break;
-                case 12:
-                    r = ~inptrA[i];
-                    break;
+                case 5: r = inptrA[i] & inptrB[i]; break;
+                case 6: r = inptrA[i] | inptrB[i]; break;
+                case 7: r = inptrA[i] ^ inptrB[i]; break;
+                case 8: r = inptrA[i] >> (inptrB[i] & shift_mask); break;
+                case 9: r = inptrA[i] << (inptrB[i] & shift_mask); break;
+                case 10: r = inptrA[i] >> (inptrB[j] & shift_mask); break;
+                case 11: r = inptrA[i] << (inptrB[j] & shift_mask); break;
+                case 12: r = ~inptrA[i]; break;
                 case 13:
                     r = (inptrA[j] < inptrB[j]) ? inptrA[i] : inptrB[i];
                     break;
                 case 14:
-                    // Scalars are set to 1/0
                     r = inptrA[i] && inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
+                    if (vector_size != 1 && r) r = -1;
                     break;
                 case 15:
-                    // Scalars are set to 1/0
                     r = inptrA[i] || inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
+                    if (vector_size != 1 && r) r = -1;
                     break;
                 case 16:
-                    // Scalars are set to 1/0
                     r = inptrA[i] < inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
+                    if (vector_size != 1 && r) r = -1;
                     break;
                 case 17:
-                    // Scalars are set to 1/0
                     r = inptrA[i] > inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
+                    if (vector_size != 1 && r) r = -1;
                     break;
                 case 18:
-                    // Scalars are set to 1/0
                     r = inptrA[i] <= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
+                    if (vector_size != 1 && r) r = -1;
                     break;
                 case 19:
-                    // Scalars are set to 1/0
                     r = inptrA[i] >= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
+                    if (vector_size != 1 && r) r = -1;
                     break;
                 case 20:
-                    // Scalars are set to 1/0
                     r = inptrA[i] == inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
+                    if (vector_size != 1 && r) r = -1;
                     break;
                 case 21:
-                    // Scalars are set to 1/0
                     r = inptrA[i] != inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
+                    if (vector_size != 1 && r) r = -1;
                     break;
                 case 22:
-                    // Scalars are set to 1/0
                     r = !inptrA[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                default:
-                    log_error("Invalid test: %d\n", test);
-                    return -1;
+                    if (vector_size != 1 && r) r = -1;
                     break;
             }
+            ref[i] = r;
+        }
+    }
+}
+
+static void wait_for_event(cl_event &event)
+{
+    if (event != nullptr)
+    {
+        clWaitForEvents(1, &event);
+        clReleaseEvent(event);
+        event = nullptr;
+    }
+}
+
+// =======================================
+// long
+// =======================================
+int verify_long(int test, size_t vector_size, cl_long *inptrA_raw,
+                cl_long *inptrB_raw, cl_long *outptr, cl_long *ref, size_t n,
+                bool a_scalar, bool b_scalar, cl_event &event)
+{
+    cl_long shift_mask = (sizeof(cl_long) * 8) - 1;
+    wait_for_event(event);
+    WRAP_INPUTS(cl_long);
+    compute_references(test, vector_size, inptrA, inptrB, outptr, ref, n,
+                       shift_mask);
+    if (memcmp(ref, outptr, n * sizeof(cl_long)) == 0)
+    {
+        return 0;
+    }
+
+    int count=0;
+    for (size_t j=0; j<n; j += vector_size )
+    {
+        for (size_t i = j; i < j + vector_size; i++)
+        {
+            cl_long r = ref[i];
             if (r != outptr[i]) {
                 // Shift is tricky
                 if (test == 8 || test == 9) {
@@ -280,172 +297,54 @@ verify_long(int test, size_t vector_size, cl_long *inptrA, cl_long *inptrB, cl_l
     if (count) return -1; else return 0;
 }
 
-void
-init_long_data(uint64_t indx, int num_elements, cl_long *input_ptr[], MTdata d)
+void init_long_data(uint64_t indx, uint32_t num_elements, cl_long *input_ptr[],
+                    MTdata d, int num_runs_shift)
 {
-    cl_ulong        *p = (cl_ulong *)input_ptr[0];
-    int         j;
-
-    if (indx == 0) {
-        // Do the tricky values the first time around
-        fill_test_values( input_ptr[ 0 ], input_ptr[ 1 ], (size_t)num_elements, d );
-    } else {
-        // Then just test lots of random ones.
-        for (j=0; j<num_elements; j++) {
-            cl_uint a = (cl_uint)genrand_int32(d);
-            cl_uint b = (cl_uint)genrand_int32(d);
-            p[j] = ((cl_ulong)a <<32 | b);
+    auto specialValues = GetIntSpecialValues<uint64_t>(gLock, 1, gWimpyMode);
+    assert((1ULL << (num_runs_shift / 2)) >= specialValues.size());
+    auto init = [&specialValues, &num_elements, &d](cl_long *ptr,
+                                                    uint64_t offset) {
+        uint32_t index;
+        for (index = 0;
+             ((index + offset) < specialValues.size()) && index < num_elements;
+             index++)
+        {
+            ptr[index] =
+                bitcast<uint64_t, cl_long>(specialValues[index + offset]);
         }
-        p = (cl_ulong *)input_ptr[1];
-        for (j=0; j<num_elements; j++) {
-            cl_uint a = (cl_uint)genrand_int32(d);
-            cl_uint b = (cl_uint)genrand_int32(d);
-            p[j] = ((cl_ulong)a <<32 | b);
+        for (; index < num_elements; index++)
+        {
+            ptr[index] = bitcast<cl_ulong, cl_long>(genrand_int64(d));
         }
-    }
+    };
+    init(input_ptr[0], indx & MASK(num_runs_shift / 2));
+    init(input_ptr[1], indx >> (num_runs_shift / 2));
 }
 
 
 // =======================================
 // ulong
 // =======================================
-int
-verify_ulong(int test, size_t vector_size, cl_ulong *inptrA, cl_ulong *inptrB, cl_ulong *outptr, size_t n)
+int verify_ulong(int test, size_t vector_size, cl_ulong *inptrA_raw,
+                 cl_ulong *inptrB_raw, cl_ulong *outptr, cl_ulong *ref,
+                 size_t n, bool a_scalar, bool b_scalar, cl_event &event)
 {
-    cl_ulong        r, shift_mask = (sizeof(cl_ulong)*8)-1;
-    size_t          i, j;
-    int count=0;
-
-    for (j=0; j<n; j += vector_size )
+    cl_ulong shift_mask = (sizeof(cl_ulong)*8)-1;
+    wait_for_event(event);
+    WRAP_INPUTS(cl_ulong);
+    compute_references(test, vector_size, inptrA, inptrB, outptr, ref, n,
+                       shift_mask);
+    if (memcmp(ref, outptr, n * sizeof(cl_ulong)) == 0)
     {
-        for( i = j; i < j + vector_size; i++ )
+        return 0;
+    }
+
+    int count=0;
+    for (size_t j = 0; j < n; j += vector_size)
+    {
+        for (size_t i = j; i < j + vector_size; i++)
         {
-            switch (test) {
-                case 0:
-                    r = inptrA[i] + inptrB[i];
-                    break;
-                case 1:
-                    r = inptrA[i] - inptrB[i];
-                    break;
-                case 2:
-                    r = inptrA[i] * inptrB[i];
-                    break;
-                case 3:
-                    if (inptrB[i] == 0)
-                        continue;
-                    else
-                        r = inptrA[i] / inptrB[i];
-                    break;
-                case 4:
-                    if (inptrB[i] == 0)
-                        continue;
-                    else
-                        r = inptrA[i] % inptrB[i];
-                    break;
-                case 5:
-                    r = inptrA[i] & inptrB[i];
-                    break;
-                case 6:
-                    r = inptrA[i] | inptrB[i];
-                    break;
-                case 7:
-                    r = inptrA[i] ^ inptrB[i];
-                    break;
-                case 8:
-                    r = inptrA[i] >> (inptrB[i] & shift_mask);
-                    break;
-                case 9:
-                    r = inptrA[i] << (inptrB[i] & shift_mask);
-                    break;
-                case 10:
-                    r = inptrA[i] >> (inptrB[j] & shift_mask);
-                    break;
-                case 11:
-                    r = inptrA[i] << (inptrB[j] & shift_mask);
-                    break;
-                case 12:
-                    r = ~inptrA[i];
-                    break;
-                case 13:
-                    r = (inptrA[j] < inptrB[j]) ? inptrA[i] : inptrB[i];
-                    break;
-                case 14:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] && inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 15:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] || inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 16:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] < inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 17:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] > inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 18:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] <= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 19:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] >= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 20:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] == inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 21:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] != inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 22:
-                    // Scalars are set to 1/0
-                    r = !inptrA[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                default:
-                    log_error("Invalid test: %d\n", test);
-                    return -1;
-                    break;
-            }
+            cl_ulong r = ref[i];
             if (r != outptr[i]) {
                 // Shift is tricky
                 if (test == 8 || test == 9) {
@@ -504,179 +403,54 @@ verify_ulong(int test, size_t vector_size, cl_ulong *inptrA, cl_ulong *inptrB, c
     if (count) return -1; else return 0;
 }
 
-void
-init_ulong_data(uint64_t indx, int num_elements, cl_ulong *input_ptr[], MTdata d)
+void init_ulong_data(uint64_t indx, uint32_t num_elements,
+                     cl_ulong *input_ptr[], MTdata d, int num_runs_shift)
 {
-    cl_ulong        *p = (cl_ulong *)input_ptr[0];
-    int            j;
-
-    if (indx == 0)
-    {
-        // Do the tricky values the first time around
-        fill_test_values( (cl_long*)input_ptr[ 0 ], (cl_long*)input_ptr[ 1 ], (size_t)num_elements, d );
-    }
-    else
-    {
-        // Then just test lots of random ones.
-        for (j=0; j<num_elements; j++)
+    auto specialValues = GetIntSpecialValues<uint64_t>(gLock, 1, gWimpyMode);
+    assert((1ULL << (num_runs_shift / 2)) >= specialValues.size());
+    auto init = [&specialValues, &num_elements, &d](cl_ulong *ptr,
+                                                    uint64_t offset) {
+        uint32_t index;
+        for (index = 0;
+             ((index + offset) < specialValues.size()) && index < num_elements;
+             index++)
         {
-            cl_ulong a = genrand_int32(d);
-            cl_ulong b = genrand_int32(d);
-            // Fill in the top, bottom, and middle, remembering that random only sets 31 bits.
-            p[j] = (a <<32) | b;
+            ptr[index] =
+                bitcast<uint64_t, cl_ulong>(specialValues[index + offset]);
         }
-        p = (cl_ulong *)input_ptr[1];
-        for (j=0; j<num_elements; j++)
+        for (; index < num_elements; index++)
         {
-            cl_ulong a = genrand_int32(d);
-            cl_ulong b = genrand_int32(d);
-            // Fill in the top, bottom, and middle, remembering that random only sets 31 bits.
-            p[j] = (a <<32) | b;
+            ptr[index] = bitcast<cl_ulong, cl_ulong>(genrand_int64(d));
         }
-    }
+    };
+    init(input_ptr[0], indx & MASK(num_runs_shift / 2));
+    init(input_ptr[1], indx >> (num_runs_shift / 2));
 }
 
 
 // =======================================
 // int
 // =======================================
-int
-verify_int(int test, size_t vector_size, cl_int *inptrA, cl_int *inptrB, cl_int *outptr, size_t n)
+int verify_int(int test, size_t vector_size, cl_int *inptrA_raw,
+               cl_int *inptrB_raw, cl_int *outptr, cl_int *ref, size_t n,
+               bool a_scalar, bool b_scalar, cl_event &event)
 {
-    cl_int            r, shift_mask = (sizeof(cl_int)*8)-1;
-    size_t          i, j;
-    int count=0;
-
-    for (j=0; j<n; j += vector_size )
+    cl_int shift_mask = (sizeof(cl_int)*8)-1;
+    wait_for_event(event);
+    WRAP_INPUTS(cl_int);
+    compute_references(test, vector_size, inptrA, inptrB, outptr, ref, n,
+                       shift_mask);
+    if (memcmp(ref, outptr, n * sizeof(cl_int)) == 0)
     {
-        for( i = j; i < j + vector_size; i++ )
+        return 0;
+    }
+
+    int count=0;
+    for (size_t j = 0; j < n; j += vector_size)
+    {
+        for (size_t i = j; i < j + vector_size; i++)
         {
-            switch (test) {
-                case 0:
-                    r = inptrA[i] + inptrB[i];
-                    break;
-                case 1:
-                    r = inptrA[i] - inptrB[i];
-                    break;
-                case 2:
-                    r = inptrA[i] * inptrB[i];
-                    break;
-                case 3:
-                    if (inptrB[i] == 0 || (inptrB[i] == -1 && inptrA[i] == CL_INT_MIN))
-                        continue;
-                    else
-                        r = inptrA[i] / inptrB[i];
-                    break;
-                case 4:
-                    if (inptrB[i] == 0 || (inptrB[i] == -1 && inptrA[i] == CL_INT_MIN))
-                        continue;
-                    else
-                        r = inptrA[i] % inptrB[i];
-                    break;
-                case 5:
-                    r = inptrA[i] & inptrB[i];
-                    break;
-                case 6:
-                    r = inptrA[i] | inptrB[i];
-                    break;
-                case 7:
-                    r = inptrA[i] ^ inptrB[i];
-                    break;
-                case 8:
-                    r = inptrA[i] >> (inptrB[i] & shift_mask);
-                    break;
-                case 9:
-                    r = inptrA[i] << (inptrB[i] & shift_mask);
-                    break;
-                case 10:
-                    r = inptrA[i] >> (inptrB[j] & shift_mask);
-                    break;
-                case 11:
-                    r = inptrA[i] << (inptrB[j] & shift_mask);
-                    break;
-                case 12:
-                    r = ~inptrA[i];
-                    break;
-                case 13:
-                    r = (inptrA[j] < inptrB[j]) ? inptrA[i] : inptrB[i];
-                    break;
-                case 14:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] && inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 15:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] || inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 16:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] < inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 17:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] > inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 18:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] <= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 19:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] >= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 20:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] == inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 21:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] != inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 22:
-                    // Scalars are set to 1/0
-                    r = !inptrA[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                default:
-                    log_error("Invalid test: %d\n", test);
-                    return -1;
-                    break;
-            }
+            cl_int r = ref[i];
             if (r != outptr[i]) {
                 // Shift is tricky
                 if (test == 8 || test == 9) {
@@ -724,172 +498,53 @@ verify_int(int test, size_t vector_size, cl_int *inptrA, cl_int *inptrB, cl_int 
     if (count) return -1; else return 0;
 }
 
-void
-init_int_data(uint64_t indx, int num_elements, cl_int *input_ptr[], MTdata d)
+void init_int_data(uint64_t indx, uint32_t num_elements, cl_int *input_ptr[],
+                   MTdata d, int num_runs_shift)
 {
-    static const cl_int specialCaseList[] = { 0, -1, 1, CL_INT_MIN, CL_INT_MIN + 1, CL_INT_MAX };
-    int            j;
-
-    // Set the inputs to a random number
-    for (j=0; j<num_elements; j++)
-    {
-        ((cl_int *)input_ptr[0])[j] = (cl_int)genrand_int32(d);
-        ((cl_int *)input_ptr[1])[j] = (cl_int)genrand_int32(d);
-    }
-
-    // Init the first few values to test special cases
-    {
-        size_t x, y, index = 0;
-        for( x = 0; x < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); x++ )
-            for( y = 0; y < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); y++ )
-            {
-                ((cl_int *)input_ptr[0])[index] = specialCaseList[x];
-                ((cl_int *)input_ptr[1])[index++] = specialCaseList[y];
-            }
-    }
+    auto specialValues = GetIntSpecialValues<uint32_t>(gLock, 1, gWimpyMode);
+    assert((1ULL << (num_runs_shift / 2)) >= specialValues.size());
+    auto init = [&specialValues, &num_elements, &d](cl_int *ptr,
+                                                    uint64_t offset) {
+        uint32_t index;
+        for (index = 0;
+             ((index + offset) < specialValues.size()) && index < num_elements;
+             index++)
+        {
+            ptr[index] =
+                bitcast<uint32_t, cl_int>(specialValues[index + offset]);
+        }
+        for (; index < num_elements; index++)
+        {
+            ptr[index] = bitcast<cl_uint, cl_int>(genrand_int32(d));
+        }
+    };
+    init(input_ptr[0], indx & MASK(num_runs_shift / 2));
+    init(input_ptr[1], indx >> (num_runs_shift / 2));
 }
 
 
 // =======================================
 // uint
 // =======================================
-int
-verify_uint(int test, size_t vector_size, cl_uint *inptrA, cl_uint *inptrB, cl_uint *outptr, size_t n)
+int verify_uint(int test, size_t vector_size, cl_uint *inptrA_raw,
+                cl_uint *inptrB_raw, cl_uint *outptr, cl_uint *ref, size_t n,
+                bool a_scalar, bool b_scalar, cl_event &event)
 {
-    cl_uint            r, shift_mask = (sizeof(cl_uint)*8)-1;
-    size_t          i, j;
-    int count=0;
-
-    for (j=0; j<n; j += vector_size )
+    cl_uint shift_mask = (sizeof(cl_uint)*8)-1;
+    wait_for_event(event);
+    WRAP_INPUTS(cl_uint);
+    compute_references(test, vector_size, inptrA, inptrB, outptr, ref, n,
+                       shift_mask);
+    if (memcmp(ref, outptr, n * sizeof(cl_uint)) == 0)
     {
-        for( i = j; i < j + vector_size; i++ )
+        return 0;
+    }
+    int count=0;
+    for (size_t j = 0; j < n; j += vector_size)
+    {
+        for (size_t i = j; i < j + vector_size; i++)
         {
-            switch (test) {
-                case 0:
-                    r = inptrA[i] + inptrB[i];
-                    break;
-                case 1:
-                    r = inptrA[i] - inptrB[i];
-                    break;
-                case 2:
-                    r = inptrA[i] * inptrB[i];
-                    break;
-                case 3:
-                    if (inptrB[i] == 0)
-                        continue;
-                    else
-                        r = inptrA[i] / inptrB[i];
-                    break;
-                case 4:
-                    if (inptrB[i] == 0)
-                        continue;
-                    else
-                        r = inptrA[i] % inptrB[i];
-                    break;
-                case 5:
-                    r = inptrA[i] & inptrB[i];
-                    break;
-                case 6:
-                    r = inptrA[i] | inptrB[i];
-                    break;
-                case 7:
-                    r = inptrA[i] ^ inptrB[i];
-                    break;
-                case 8:
-                    r = inptrA[i] >> (inptrB[i] & shift_mask);
-                    break;
-                case 9:
-                    r = inptrA[i] << (inptrB[i] & shift_mask);
-                    break;
-                case 10:
-                    r = inptrA[i] >> (inptrB[j] & shift_mask);
-                    break;
-                case 11:
-                    r = inptrA[i] << (inptrB[j] & shift_mask);
-                    break;
-                case 12:
-                    r = ~inptrA[i];
-                    break;
-                case 13:
-                    r = (inptrA[j] < inptrB[j]) ? inptrA[i] : inptrB[i];
-                    break;
-                case 14:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] && inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 15:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] || inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 16:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] < inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 17:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] > inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 18:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] <= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 19:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] >= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 20:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] == inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 21:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] != inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 22:
-                    // Scalars are set to 1/0
-                    r = !inptrA[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                default:
-                    log_error("Invalid test: %d\n", test);
-                    return -1;
-                    break;
-            }
+            cl_uint r = ref[i];
             if (r != outptr[i]) {
                 // Shift is tricky
                 if (test == 8 || test == 9) {
@@ -936,174 +591,53 @@ verify_uint(int test, size_t vector_size, cl_uint *inptrA, cl_uint *inptrB, cl_u
     if (count) return -1; else return 0;
 }
 
-void
-init_uint_data(uint64_t indx, int num_elements, cl_uint *input_ptr[], MTdata d)
+void init_uint_data(uint64_t indx, uint32_t num_elements, cl_uint *input_ptr[],
+                    MTdata d, int num_runs_shift)
 {
-    static cl_uint specialCaseList[] = { 0, (cl_uint) CL_INT_MAX, (cl_uint) CL_INT_MAX + 1, CL_UINT_MAX-1, CL_UINT_MAX };
-    int            j;
-
-    // Set the first input to an incrementing number
-    // Set the second input to a random number
-    for (j=0; j<num_elements; j++)
-    {
-        ((cl_uint *)input_ptr[0])[j] = genrand_int32(d);
-        ((cl_uint *)input_ptr[1])[j] = genrand_int32(d);
-    }
-
-    // Init the first few values to test special cases
-    {
-        size_t x, y, index = 0;
-        for( x = 0; x < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); x++ )
-            for( y = 0; y < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); y++ )
-            {
-                ((cl_uint *)input_ptr[0])[index] = specialCaseList[x];
-                ((cl_uint *)input_ptr[1])[index++] = specialCaseList[y];
-            }
-    }
+    auto specialValues = GetIntSpecialValues<uint32_t>(gLock, 1, gWimpyMode);
+    assert((1ULL << (num_runs_shift / 2)) >= specialValues.size());
+    auto init = [&specialValues, &num_elements, &d](cl_uint *ptr,
+                                                    uint64_t offset) {
+        uint32_t index;
+        for (index = 0;
+             ((index + offset) < specialValues.size()) && index < num_elements;
+             index++)
+        {
+            ptr[index] =
+                bitcast<uint32_t, cl_uint>(specialValues[index + offset]);
+        }
+        for (; index < num_elements; index++)
+        {
+            ptr[index] = bitcast<cl_uint, cl_uint>(genrand_int32(d));
+        }
+    };
+    init(input_ptr[0], indx & MASK(num_runs_shift / 2));
+    init(input_ptr[1], indx >> (num_runs_shift / 2));
 }
 
 // =======================================
 // short
 // =======================================
-int
-verify_short(int test, size_t vector_size, cl_short *inptrA, cl_short *inptrB, cl_short *outptr, size_t n)
+int verify_short(int test, size_t vector_size, cl_short *inptrA_raw,
+                 cl_short *inptrB_raw, cl_short *outptr, cl_short *ref,
+                 size_t n, bool a_scalar, bool b_scalar, cl_event &event)
 {
-    cl_short r;
     cl_int   shift_mask = vector_size == 1 ? (cl_int)(sizeof(cl_int)*8)-1
     : (cl_int)(sizeof(cl_short)*8)-1;
-    size_t   i, j;
-    int      count=0;
-
-    for (j=0; j<n; j += vector_size )
+    wait_for_event(event);
+    WRAP_INPUTS(cl_short);
+    compute_references(test, vector_size, inptrA, inptrB, outptr, ref, n,
+                       shift_mask);
+    if (memcmp(ref, outptr, n * sizeof(cl_short)) == 0)
     {
-        for( i = j; i < j + vector_size; i++ )
+        return 0;
+    }
+    int      count=0;
+    for (size_t j = 0; j < n; j += vector_size)
+    {
+        for (size_t i = j; i < j + vector_size; i++)
         {
-            switch (test) {
-                case 0:
-                    r = inptrA[i] + inptrB[i];
-                    break;
-                case 1:
-                    r = inptrA[i] - inptrB[i];
-                    break;
-                case 2:
-                    r = inptrA[i] * inptrB[i];
-                    break;
-                case 3:
-                    if (inptrB[i] == 0 || (inptrB[i] == -1 && inptrA[i] == CL_SHRT_MIN))
-                        continue;
-                    else
-                        r = inptrA[i] / inptrB[i];
-                    break;
-                case 4:
-                    if (inptrB[i] == 0 || (inptrB[i] == -1 && inptrA[i] == CL_SHRT_MIN))
-                        continue;
-                    else
-                        r = inptrA[i] % inptrB[i];
-                    break;
-                case 5:
-                    r = inptrA[i] & inptrB[i];
-                    break;
-                case 6:
-                    r = inptrA[i] | inptrB[i];
-                    break;
-                case 7:
-                    r = inptrA[i] ^ inptrB[i];
-                    break;
-                case 8:
-                    r = inptrA[i] >> (inptrB[i] & shift_mask);
-                    break;
-                case 9:
-                    r = inptrA[i] << (inptrB[i] & shift_mask);
-                    break;
-                case 10:
-                    r = inptrA[i] >> (inptrB[j] & shift_mask);
-                    break;
-                case 11:
-                    r = inptrA[i] << (inptrB[j] & shift_mask);
-                    break;
-                case 12:
-                    r = ~inptrA[i];
-                    break;
-                case 13:
-                    r = (inptrA[j] < inptrB[j]) ? inptrA[i] : inptrB[i];
-                    break;
-                case 14:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] && inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 15:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] || inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 16:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] < inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 17:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] > inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 18:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] <= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 19:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] >= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 20:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] == inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 21:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] != inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 22:
-                    // Scalars are set to 1/0
-                    r = !inptrA[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                default:
-                    log_error("Invalid test: %d\n", test);
-                    return -1;
-                    break;
-            }
+            cl_short r = ref[i];
             if (r != outptr[i]) {
                 // Shift is tricky
                 if (test == 8 || test == 9) {
@@ -1151,175 +685,61 @@ verify_short(int test, size_t vector_size, cl_short *inptrA, cl_short *inptrB, c
     if (count) return -1; else return 0;
 }
 
-void
-init_short_data(uint64_t indx, int num_elements, cl_short *input_ptr[], MTdata d)
+void init_short_data(uint64_t indx, uint32_t num_elements,
+                     cl_short *input_ptr[], MTdata d, int num_runs_shift)
 {
-    static const cl_short specialCaseList[] = { 0, -1, 1, CL_SHRT_MIN, CL_SHRT_MIN + 1, CL_SHRT_MAX };
-    int            j;
-
-    // Set the inputs to a random number
-    for (j=0; j<num_elements; j++)
-    {
-        cl_uint bits = genrand_int32(d);
-        ((cl_short *)input_ptr[0])[j] = (cl_short) bits;
-        ((cl_short *)input_ptr[1])[j] = (cl_short) (bits >> 16);
-    }
-
-    // Init the first few values to test special cases
-    {
-        size_t x, y, index = 0;
-        for( x = 0; x < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); x++ )
-            for( y = 0; y < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); y++ )
-            {
-                ((cl_short *)input_ptr[0])[index] = specialCaseList[x];
-                ((cl_short *)input_ptr[1])[index++] = specialCaseList[y];
-            }
-    }
+    auto specialValues = GetIntSpecialValues<uint16_t>(gLock, 1, gWimpyMode);
+    assert((1ULL << (num_runs_shift / 2)) >= specialValues.size());
+    auto init = [&specialValues, &num_elements, &d](cl_short *ptr,
+                                                    uint64_t offset) {
+        uint32_t index;
+        for (index = 0;
+             ((index + offset) < specialValues.size()) && index < num_elements;
+             index++)
+        {
+            ptr[index] =
+                bitcast<uint16_t, cl_short>(specialValues[index + offset]);
+        }
+        for (; (index + 1) < num_elements; index += 2)
+        {
+            cl_uint random = genrand_int32(d);
+            ptr[index] = bitcast<cl_ushort, cl_short>(random & 0xffff);
+            ptr[index + 1] = bitcast<cl_ushort, cl_short>(random >> 16);
+        }
+        if (index < num_elements)
+        {
+            ptr[index] =
+                bitcast<cl_ushort, cl_short>(genrand_int32(d) & 0xffff);
+        }
+    };
+    init(input_ptr[0], indx & MASK(num_runs_shift / 2));
+    init(input_ptr[1], indx >> (num_runs_shift / 2));
 }
 
 
 // =======================================
 // ushort
 // =======================================
-int
-verify_ushort(int test, size_t vector_size, cl_ushort *inptrA, cl_ushort *inptrB, cl_ushort *outptr, size_t n)
+int verify_ushort(int test, size_t vector_size, cl_ushort *inptrA_raw,
+                  cl_ushort *inptrB_raw, cl_ushort *outptr, cl_ushort *ref,
+                  size_t n, bool a_scalar, bool b_scalar, cl_event &event)
 {
-    cl_ushort       r;
     cl_uint   shift_mask = vector_size == 1 ? (cl_uint)(sizeof(cl_uint)*8)-1
     : (cl_uint)(sizeof(cl_ushort)*8)-1;
-    size_t          i, j;
-    int             count=0;
-
-    for (j=0; j<n; j += vector_size )
+    wait_for_event(event);
+    WRAP_INPUTS(cl_ushort);
+    compute_references(test, vector_size, inptrA, inptrB, outptr, ref, n,
+                       shift_mask);
+    if (memcmp(ref, outptr, n * sizeof(cl_ushort)) == 0)
     {
-        for( i = j; i < j + vector_size; i++ )
+        return 0;
+    }
+    int             count=0;
+    for (size_t j = 0; j < n; j += vector_size)
+    {
+        for (size_t i = j; i < j + vector_size; i++)
         {
-            switch (test) {
-                case 0:
-                    r = inptrA[i] + inptrB[i];
-                    break;
-                case 1:
-                    r = inptrA[i] - inptrB[i];
-                    break;
-                case 2:
-                    r = inptrA[i] * inptrB[i];
-                    break;
-                case 3:
-                    if (inptrB[i] == 0)
-                        continue;
-                    else
-                        r = inptrA[i] / inptrB[i];
-                    break;
-                case 4:
-                    if (inptrB[i] == 0)
-                        continue;
-                    else
-                        r = inptrA[i] % inptrB[i];
-                    break;
-                case 5:
-                    r = inptrA[i] & inptrB[i];
-                    break;
-                case 6:
-                    r = inptrA[i] | inptrB[i];
-                    break;
-                case 7:
-                    r = inptrA[i] ^ inptrB[i];
-                    break;
-                case 8:
-                    r = inptrA[i] >> (inptrB[i] & shift_mask);
-                    break;
-                case 9:
-                    r = inptrA[i] << (inptrB[i] & shift_mask);
-                    break;
-                case 10:
-                    r = inptrA[i] >> (inptrB[j] & shift_mask);
-                    break;
-                case 11:
-                    r = inptrA[i] << (inptrB[j] & shift_mask);
-                    break;
-                case 12:
-                    r = ~inptrA[i];
-                    break;
-                case 13:
-                    r = (inptrA[j] < inptrB[j]) ? inptrA[i] : inptrB[i];
-                    break;
-                case 14:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] && inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 15:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] || inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 16:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] < inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 17:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] > inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 18:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] <= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 19:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] >= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 20:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] == inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 21:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] != inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 22:
-                    // Scalars are set to 1/0
-                    r = !inptrA[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                default:
-                    log_error("Invalid test: %d\n", test);
-                    return -1;
-                    break;
-            }
+            cl_ushort r = ref[i];
             if (r != outptr[i]) {
                 // Shift is tricky
                 if (test == 8 || test == 9) {
@@ -1367,32 +787,35 @@ verify_ushort(int test, size_t vector_size, cl_ushort *inptrA, cl_ushort *inptrB
     if (count) return -1; else return 0;
 }
 
-void
-init_ushort_data(uint64_t indx, int num_elements, cl_ushort *input_ptr[], MTdata d)
+void init_ushort_data(uint64_t indx, uint32_t num_elements,
+                      cl_ushort *input_ptr[], MTdata d, int num_runs_shift)
 {
-    static const cl_ushort specialCaseList[] = {
-        0, (cl_ushort)-1, 1, CL_SHRT_MAX, CL_SHRT_MAX + 1, CL_USHRT_MAX
+    auto specialValues = GetIntSpecialValues<uint16_t>(gLock, 1, gWimpyMode);
+    assert((1ULL << (num_runs_shift / 2)) >= specialValues.size());
+    auto init = [&specialValues, &num_elements, &d](cl_ushort *ptr,
+                                                    uint64_t offset) {
+        uint32_t index;
+        for (index = 0;
+             ((index + offset) < specialValues.size()) && index < num_elements;
+             index++)
+        {
+            ptr[index] =
+                bitcast<uint16_t, cl_ushort>(specialValues[index + offset]);
+        }
+        for (; (index + 1) < num_elements; index += 2)
+        {
+            cl_uint random = genrand_int32(d);
+            ptr[index] = bitcast<cl_ushort, cl_ushort>(random & 0xffff);
+            ptr[index + 1] = bitcast<cl_ushort, cl_ushort>(random >> 16);
+        }
+        if (index < num_elements)
+        {
+            ptr[index] =
+                bitcast<cl_ushort, cl_ushort>(genrand_int32(d) & 0xffff);
+        }
     };
-    int            j;
-
-    // Set the inputs to a random number
-    for (j=0; j<num_elements; j++)
-    {
-        cl_uint bits = genrand_int32(d);
-        ((cl_ushort *)input_ptr[0])[j] = (cl_ushort) bits;
-        ((cl_ushort *)input_ptr[1])[j] = (cl_ushort) (bits >> 16);
-    }
-
-    // Init the first few values to test special cases
-    {
-        size_t x, y, index = 0;
-        for( x = 0; x < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); x++ )
-            for( y = 0; y < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); y++ )
-            {
-                ((cl_ushort *)input_ptr[0])[index] = specialCaseList[x];
-                ((cl_ushort *)input_ptr[1])[index++] = specialCaseList[y];
-            }
-    }
+    init(input_ptr[0], indx & MASK(num_runs_shift / 2));
+    init(input_ptr[1], indx >> (num_runs_shift / 2));
 }
 
 
@@ -1400,146 +823,26 @@ init_ushort_data(uint64_t indx, int num_elements, cl_ushort *input_ptr[], MTdata
 // =======================================
 // char
 // =======================================
-int
-verify_char(int test, size_t vector_size, cl_char *inptrA, cl_char *inptrB, cl_char *outptr, size_t n)
+int verify_char(int test, size_t vector_size, cl_char *inptrA_raw,
+                cl_char *inptrB_raw, cl_char *outptr, cl_char *ref, size_t n,
+                bool a_scalar, bool b_scalar, cl_event &event)
 {
-    cl_char   r;
     cl_int    shift_mask = vector_size == 1 ? (cl_int)(sizeof(cl_int)*8)-1
     : (cl_int)(sizeof(cl_char)*8)-1;
-    size_t    i, j;
-    int       count=0;
-
-    for (j=0; j<n; j += vector_size )
+    wait_for_event(event);
+    WRAP_INPUTS(cl_char);
+    compute_references(test, vector_size, inptrA, inptrB, outptr, ref, n,
+                       shift_mask);
+    if (memcmp(ref, outptr, n * sizeof(cl_char)) == 0)
     {
-        for( i = j; i < j + vector_size; i++ )
+        return 0;
+    }
+    int count = 0;
+    for (size_t j = 0; j < n; j += vector_size)
+    {
+        for (size_t i = j; i < j + vector_size; i++)
         {
-
-            switch (test) {
-                case 0:
-                    r = inptrA[i] + inptrB[i];
-                    break;
-                case 1:
-                    r = inptrA[i] - inptrB[i];
-                    break;
-                case 2:
-                    r = inptrA[i] * inptrB[i];
-                    break;
-                case 3:
-                    if (inptrB[i] == 0 || (inptrB[i] == -1 && inptrA[i] == CL_CHAR_MIN))
-                        continue;
-                    else
-                        r = inptrA[i] / inptrB[i];
-                    break;
-                case 4:
-                    if (inptrB[i] == 0 || (inptrB[i] == -1 && inptrA[i] == CL_CHAR_MIN))
-                        continue;
-                    else
-                        r = inptrA[i] % inptrB[i];
-                    break;
-                case 5:
-                    r = inptrA[i] & inptrB[i];
-                    break;
-                case 6:
-                    r = inptrA[i] | inptrB[i];
-                    break;
-                case 7:
-                    r = inptrA[i] ^ inptrB[i];
-                    break;
-                case 8:
-                    r = inptrA[i] >> (inptrB[i] & shift_mask);
-                    break;
-                case 9:
-                    r = inptrA[i] << (inptrB[i] & shift_mask);
-                    break;
-                case 10:
-                    r = inptrA[i] >> (inptrB[j] & shift_mask);
-                    break;
-                case 11:
-                    r = inptrA[i] << (inptrB[j] & shift_mask);
-                    break;
-                case 12:
-                    r = ~inptrA[i];
-                    break;
-                case 13:
-                    r = (inptrA[j] < inptrB[j]) ? inptrA[i] : inptrB[i];
-                    break;
-                case 14:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] && inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 15:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] || inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 16:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] < inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 17:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] > inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 18:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] <= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 19:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] >= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 20:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] == inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 21:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] != inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 22:
-                    // Scalars are set to 1/0
-                    r = !inptrA[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                default:
-                    log_error("Invalid test: %d\n", test);
-                    return -1;
-                    break;
-            }
+            cl_char r = ref[i];
             if (r != outptr[i]) {
                 // Shift is tricky
                 if (test == 8 || test == 9) {
@@ -1586,38 +889,14 @@ verify_char(int test, size_t vector_size, cl_char *inptrA, cl_char *inptrB, cl_c
     if (count) return -1; else return 0;
 }
 
-void
-init_char_data(uint64_t indx, int num_elements, cl_char *input_ptr[], MTdata d)
+void init_char_data(uint64_t indx, uint32_t num_elements, cl_char *input_ptr[],
+                    MTdata d)
 {
-    static const cl_char specialCaseList[] = { 0, -1, 1, CL_CHAR_MIN, CL_CHAR_MIN + 1, CL_CHAR_MAX };
-    int            j;
-
-    // FIXME comment below might not be appropriate for
-    // vector data.  Yes, checking every scalar char against every
-    // scalar char is only 2^16 ~ 64000 tests, but once we get to vec3,
-    // vec4, vec8...
-
-    // in the meantime, this means I can use [] to access vec3 instead of
-    // vload3 / vstore3 :D
-
-    // FIXME: we really should just check every char against every char here
-    // Set the inputs to a random number
-    for (j=0; j<num_elements; j++)
+    for (uint32_t j = 0; j < num_elements; j++)
     {
-        cl_uint bits = genrand_int32(d);
-        ((cl_char *)input_ptr[0])[j] = (cl_char) bits;
-        ((cl_char *)input_ptr[1])[j] = (cl_char) (bits >> 16);
-    }
-
-    // Init the first few values to test special cases
-    {
-        size_t x, y, index = 0;
-        for( x = 0; x < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); x++ )
-            for( y = 0; y < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); y++ )
-            {
-                ((cl_char *)input_ptr[0])[index] = specialCaseList[x];
-                ((cl_char *)input_ptr[1])[index++] = specialCaseList[y];
-            }
+        cl_ushort bits = (indx + j) & 0xffff;
+        ((cl_char *)input_ptr[0])[j] = bitcast<cl_uchar, cl_char>(bits & 0xff);
+        ((cl_char *)input_ptr[1])[j] = bitcast<cl_uchar, cl_char>(bits >> 8);
     }
 }
 
@@ -1625,145 +904,26 @@ init_char_data(uint64_t indx, int num_elements, cl_char *input_ptr[], MTdata d)
 // =======================================
 // uchar
 // =======================================
-int
-verify_uchar(int test, size_t vector_size, cl_uchar *inptrA, cl_uchar *inptrB, cl_uchar *outptr, size_t n)
+int verify_uchar(int test, size_t vector_size, cl_uchar *inptrA_raw,
+                 cl_uchar *inptrB_raw, cl_uchar *outptr, cl_uchar *ref,
+                 size_t n, bool a_scalar, bool b_scalar, cl_event &event)
 {
-    cl_uchar r;
     cl_uint shift_mask = vector_size == 1 ? (cl_uint)(sizeof(cl_uint) * 8) - 1
                                           : (cl_uint)(sizeof(cl_uchar) * 8) - 1;
-    size_t   i, j;
-    int      count=0;
-
-    for (j=0; j<n; j += vector_size )
+    wait_for_event(event);
+    WRAP_INPUTS(cl_uchar);
+    compute_references(test, vector_size, inptrA, inptrB, outptr, ref, n,
+                       shift_mask);
+    if (memcmp(ref, outptr, n * sizeof(cl_uchar)) == 0)
     {
-        for( i = j; i < j + vector_size; i++ )
+        return 0;
+    }
+    int count = 0;
+    for (size_t j = 0; j < n; j += vector_size)
+    {
+        for (size_t i = j; i < j + vector_size; i++)
         {
-            switch (test) {
-                case 0:
-                    r = inptrA[i] + inptrB[i];
-                    break;
-                case 1:
-                    r = inptrA[i] - inptrB[i];
-                    break;
-                case 2:
-                    r = inptrA[i] * inptrB[i];
-                    break;
-                case 3:
-                    if (inptrB[i] == 0)
-                        continue;
-                    else
-                        r = inptrA[i] / inptrB[i];
-                    break;
-                case 4:
-                    if (inptrB[i] == 0)
-                        continue;
-                    else
-                        r = inptrA[i] % inptrB[i];
-                    break;
-                case 5:
-                    r = inptrA[i] & inptrB[i];
-                    break;
-                case 6:
-                    r = inptrA[i] | inptrB[i];
-                    break;
-                case 7:
-                    r = inptrA[i] ^ inptrB[i];
-                    break;
-                case 8:
-                    r = inptrA[i] >> (inptrB[i] & shift_mask);
-                    break;
-                case 9:
-                    r = inptrA[i] << (inptrB[i] & shift_mask);
-                    break;
-                case 10:
-                    r = inptrA[i] >> (inptrB[j] & shift_mask);
-                    break;
-                case 11:
-                    r = inptrA[i] << (inptrB[j] & shift_mask);
-                    break;
-                case 12:
-                    r = ~inptrA[i];
-                    break;
-                case 13:
-                    r = (inptrA[j] < inptrB[j]) ? inptrA[i] : inptrB[i];
-                    break;
-                case 14:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] && inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 15:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] || inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 16:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] < inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 17:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] > inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 18:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] <= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 19:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] >= inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 20:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] == inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 21:
-                    // Scalars are set to 1/0
-                    r = inptrA[i] != inptrB[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                case 22:
-                    // Scalars are set to 1/0
-                    r = !inptrA[i];
-                    // Vectors are set to -1/0
-                    if (vector_size != 1 && r) {
-                        r = -1;
-                    }
-                    break;
-                default:
-                    log_error("Invalid test: %d\n", test);
-                    return -1;
-                    break;
-            }
+            cl_uchar r = ref[i];
             if (r != outptr[i]) {
                 // Shift is tricky
                 if (test == 8 || test == 9) {
@@ -1811,33 +971,15 @@ verify_uchar(int test, size_t vector_size, cl_uchar *inptrA, cl_uchar *inptrB, c
     if (count) return -1; else return 0;
 }
 
-void
-init_uchar_data(uint64_t indx, int num_elements, cl_uchar *input_ptr[], MTdata d)
+void init_uchar_data(uint64_t indx, uint32_t num_elements,
+                     cl_uchar *input_ptr[], MTdata d)
 {
-    static const cl_uchar specialCaseList[] = {
-        0, (cl_uchar)-1, 1, CL_CHAR_MAX, CL_CHAR_MAX + 1, CL_UCHAR_MAX
-    };
-    int            j;
-
-    // FIXME: we really should just check every char against every char here
-
-    // Set the inputs to a random number
-    for (j=0; j<num_elements; j++)
+    for (uint32_t j = 0; j < num_elements; j++)
     {
-        cl_uint bits = genrand_int32(d);
-        ((cl_uchar *)input_ptr[0])[j] = (cl_uchar) bits;
-        ((cl_uchar *)input_ptr[1])[j] = (cl_uchar) (bits >> 16);
-    }
-
-    // Init the first few values to test special cases
-    {
-        size_t x, y, index = 0;
-        for( x = 0; x < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); x++ )
-            for( y = 0; y < sizeof( specialCaseList ) / sizeof( specialCaseList[0] ); y++ )
-            {
-                ((cl_uchar *)input_ptr[0])[index] = specialCaseList[x];
-                ((cl_uchar *)input_ptr[1])[index++] = specialCaseList[y];
-            }
+        cl_ushort bits = (indx + j) & 0xffff;
+        ((cl_uchar *)input_ptr[0])[j] =
+            bitcast<cl_uchar, cl_uchar>(bits & 0xff);
+        ((cl_uchar *)input_ptr[1])[j] = bitcast<cl_uchar, cl_uchar>(bits >> 8);
     }
 }
 
