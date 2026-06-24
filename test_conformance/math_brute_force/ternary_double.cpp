@@ -69,47 +69,13 @@ int TestFunc_Double_Double_Double_Double(const Func *f, MTdata d,
                                &build_info)))
         return error;
 
-    const std::vector<double> &specialValues = getDoubleSpecialValues();
-    size_t specialValuesCount = specialValues.size();
-    for (uint64_t i = 0; i < (1ULL << 32); i += step)
+    for (uint64_t i = 0; i < getInputCount(); i += step)
     {
         if (gSkipCorrectnessTesting) break;
 
         // Init input array
-        double *p = (double *)gIn;
-        double *p2 = (double *)gIn2;
-        double *p3 = (double *)gIn3;
-        size_t idx = 0;
-
-        if (i == 0)
-        { // test edge cases
-            uint32_t x, y, z;
-            x = y = z = 0;
-            for (; idx < BUFFER_SIZE / sizeof(double); idx++)
-            {
-                p[idx] = specialValues[x];
-                p2[idx] = specialValues[y];
-                p3[idx] = specialValues[z];
-                if (++x >= specialValuesCount)
-                {
-                    x = 0;
-                    if (++y >= specialValuesCount)
-                    {
-                        y = 0;
-                        if (++z >= specialValuesCount) break;
-                    }
-                }
-            }
-            if (idx == BUFFER_SIZE / sizeof(double))
-                vlog_error("Test Error: not all special cases tested!\n");
-        }
-
-        for (; idx < BUFFER_SIZE / sizeof(double); idx++)
-        {
-            p[idx] = DoubleFromUInt32(genrand_int32(d));
-            p2[idx] = DoubleFromUInt32(genrand_int32(d));
-            p3[idx] = DoubleFromUInt32(genrand_int32(d));
-        }
+        fillDoubleTernaryInput((cl_double *)gIn, (cl_double *)gIn2,
+                               (cl_double *)gIn3, step, i, d);
 
         if ((error = clEnqueueWriteBuffer(gQueue, gInBuffer, CL_FALSE, 0,
                                           BUFFER_SIZE, gIn, 0, NULL, NULL)))
@@ -163,6 +129,7 @@ int TestFunc_Double_Double_Double_Double(const Func *f, MTdata d,
         }
 
         // Run the kernels
+        cl_event e[VECTOR_SIZE_COUNT];
         for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
         {
             size_t vectorSize = sizeof(cl_double) * sizeValues[j];
@@ -188,6 +155,13 @@ int TestFunc_Double_Double_Double_Double(const Func *f, MTdata d,
                 vlog_error("FAILED -- could not execute kernel\n");
                 return error;
             }
+            if ((error =
+                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_FALSE, 0,
+                                         BUFFER_SIZE, gOut[j], 0, NULL, &e[j])))
+            {
+                vlog_error("ReadArray failed %d\n", error);
+                return error;
+            }
         }
 
         // Get that moving
@@ -201,26 +175,24 @@ int TestFunc_Double_Double_Double_Double(const Func *f, MTdata d,
         for (size_t j = 0; j < BUFFER_SIZE / sizeof(double); j++)
             r[j] = (double)f->dfunc.f_fff(s[j], s2[j], s3[j]);
 
-        // Read the data back
-        for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
-        {
-            if ((error =
-                     clEnqueueReadBuffer(gQueue, gOutBuffer[j], CL_TRUE, 0,
-                                         BUFFER_SIZE, gOut[j], 0, NULL, NULL)))
-            {
-                vlog_error("ReadArray failed %d\n", error);
-                return error;
-            }
-        }
-
         // Verify data
         uint64_t *t = (uint64_t *)gOut_Ref;
-        for (size_t j = 0; j < BUFFER_SIZE / sizeof(double); j++)
+        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
         {
-            for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+            // Wait for the map to finish
+            if ((error = clWaitForEvents(1, e + k)))
             {
-                uint64_t *q = (uint64_t *)(gOut[k]);
-
+                vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
+                return error;
+            }
+            if ((error = clReleaseEvent(e[k])))
+            {
+                vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+                return error;
+            }
+            uint64_t *q = (uint64_t *)(gOut[k]);
+            for (size_t j = 0; j < BUFFER_SIZE / sizeof(double); j++)
+            {
                 // If we aren't getting the correctly rounded result
                 if (t[j] != q[j])
                 {

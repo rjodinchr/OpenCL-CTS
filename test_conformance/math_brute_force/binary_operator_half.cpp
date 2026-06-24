@@ -53,7 +53,7 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
     TestInfo *job = (TestInfo *)data;
     size_t buffer_elements = job->subBufferSize;
     size_t buffer_size = buffer_elements * sizeof(cl_half);
-    cl_uint base = job_id * (cl_uint)job->step;
+    cl_uint base = job_id * (cl_uint)buffer_elements;
     ThreadInfoBinary *tinfo = &(job->tinfo[thread_id]);
     float ulps = job->ulps;
     fptr func = job->f->func;
@@ -92,41 +92,8 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
     // Init input array
     cl_half *p = (cl_half *)gIn + thread_id * buffer_elements;
     cl_half *p2 = (cl_half *)gIn2 + thread_id * buffer_elements;
-    cl_uint idx = 0;
+    fillHalfBinaryInput((cl_half *)p, (cl_half *)p2, buffer_elements, base, d);
 
-    const std::vector<cl_half> &specialValuesHalf = getHalfSpecialValues();
-    size_t specialValuesHalfCount = specialValuesHalf.size();
-    int totalSpecialValueCount =
-        specialValuesHalfCount * specialValuesHalfCount;
-    int lastSpecialJobIndex = (totalSpecialValueCount - 1) / buffer_elements;
-
-    if (job_id <= (cl_uint)lastSpecialJobIndex)
-    {
-        // Insert special values
-        uint32_t x, y;
-
-        x = (job_id * buffer_elements) % specialValuesHalfCount;
-        y = (job_id * buffer_elements) / specialValuesHalfCount;
-
-        for (; idx < buffer_elements; idx++)
-        {
-            p[idx] = specialValuesHalf[x];
-            p2[idx] = specialValuesHalf[y];
-            if (++x >= specialValuesHalfCount)
-            {
-                x = 0;
-                y++;
-                if (y >= specialValuesHalfCount) break;
-            }
-        }
-    }
-
-    // Init any remaining values
-    for (; idx < buffer_elements; idx++)
-    {
-        p[idx] = (cl_half)genrand_int32(d);
-        p2[idx] = (cl_half)genrand_int32(d);
-    }
     if ((error = clEnqueueWriteBuffer(tinfo->tQueue, tinfo->inBuf, CL_FALSE, 0,
                                       buffer_size, p, 0, NULL, NULL)))
     {
@@ -197,6 +164,15 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
             vlog_error("FAILED -- could not execute kernel\n");
             return error;
         }
+        out[j] = (cl_ushort *)clEnqueueMapBuffer(
+            tinfo->tQueue, tinfo->outBuf[j], CL_FALSE, CL_MAP_READ, 0,
+            buffer_size, 0, NULL, &e[j], &error);
+        if (error || NULL == out[j])
+        {
+            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
+                       error);
+            return error;
+        }
     }
 
     // Get that moving
@@ -230,27 +206,21 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
 
     if (ftz) RestoreFPState(&oldMode);
 
-    // Read the data back -- no need to wait for the first N-1 buffers but wait
-    // for the last buffer. This is an in order queue.
-    for (auto j = gMinVectorSizeIndex; j < gMaxVectorSizeIndex; j++)
+    // Verify data
+    for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
     {
-        cl_bool blocking = (j + 1 < gMaxVectorSizeIndex) ? CL_FALSE : CL_TRUE;
-        out[j] = (cl_ushort *)clEnqueueMapBuffer(
-            tinfo->tQueue, tinfo->outBuf[j], blocking, CL_MAP_READ, 0,
-            buffer_size, 0, NULL, NULL, &error);
-        if (error || NULL == out[j])
+        // Wait for the map to finish
+        if ((error = clWaitForEvents(1, e + k)))
         {
-            vlog_error("Error: clEnqueueMapBuffer %d failed! err: %d\n", j,
-                       error);
+            vlog_error("Error: clWaitForEvents failed! err: %d\n", error);
             return error;
         }
-    }
-
-    // Verify data
-
-    for (size_t j = 0; j < buffer_elements; j++)
-    {
-        for (auto k = gMinVectorSizeIndex; k < gMaxVectorSizeIndex; k++)
+        if ((error = clReleaseEvent(e[k])))
+        {
+            vlog_error("Error: clReleaseEvent failed! err: %d\n", error);
+            return error;
+        }
+        for (size_t j = 0; j < buffer_elements; j++)
         {
             cl_half *q = out[k];
 
@@ -457,10 +427,9 @@ cl_int TestHalf(cl_uint job_id, cl_uint thread_id, void *data)
     {
         if (gVerboseBruteForce)
         {
-            vlog("base:%14u step:%10u scale:%10u buf_elements:%10zu ulps:%5.3f "
+            vlog("base:%14u buf_elements:%10zu ulps:%5.3f "
                  "ThreadCount:%2u\n",
-                 base, job->step, job->scale, buffer_elements, job->ulps,
-                 job->threadCount);
+                 base, buffer_elements, job->ulps, job->threadCount);
         }
         else
         {
@@ -488,18 +457,8 @@ int TestFunc_Half_Half_Half_Operator(const Func *f, MTdata d, bool relaxedMode)
     test_info.threadCount = GetThreadCount();
     test_info.subBufferSize = BUFFER_SIZE
         / (sizeof(cl_half) * RoundUpToNextPowerOfTwo(test_info.threadCount));
-    test_info.scale = getTestScale(sizeof(cl_half));
-
-    test_info.step = (cl_uint)test_info.subBufferSize * test_info.scale;
-    if (test_info.step / test_info.subBufferSize != test_info.scale)
-    {
-        // there was overflow
-        test_info.jobCount = 1;
-    }
-    else
-    {
-        test_info.jobCount = (cl_uint)((1ULL << 32) / test_info.step);
-    }
+    test_info.jobCount = std::max(
+        (cl_uint)1, (cl_uint)(getInputCount() / test_info.subBufferSize));
 
     test_info.f = f;
     test_info.ulps = getAllowedUlpError(f, khalf, relaxedMode);
