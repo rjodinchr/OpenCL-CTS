@@ -16,67 +16,20 @@
 
 #include <stdio.h>
 #include <string.h>
-#include "../testBase.h"
+#include "../common.h"
 #include "../harness/compat.h"
 #include "../harness/testHarness.h"
+#include "test_copy_generic.h"
 
-bool gDebugTrace;
-bool gTestSmallImages;
-bool gTestMaxImages;
-bool gEnablePitch;
-bool gTestMipmaps;
-int gTypesToTest;
-cl_channel_type gChannelTypeToUse = (cl_channel_type)-1;
-cl_channel_order gChannelOrderToUse = (cl_channel_order)-1;
+static context_t ctx;
 
-extern int test_image_set( cl_device_id device, cl_context context, cl_command_queue queue, MethodsToTest testMethod );
+static std::vector<TestConfigs> test_configs;
 
-REGISTER_TEST(1D) { return test_image_set(device, context, queue, k1D); }
-REGISTER_TEST(2D) { return test_image_set(device, context, queue, k2D); }
-REGISTER_TEST(3D) { return test_image_set(device, context, queue, k3D); }
-REGISTER_TEST(1Dbuffer)
+static int test_image_set(cl_device_id device, cl_context context,
+                          cl_command_queue queue, int num_elements, void *arg)
 {
-    return test_image_set(device, context, queue, k1DBuffer);
-}
-REGISTER_TEST(1DTo1Dbuffer)
-{
-    return test_image_set(device, context, queue, k1DTo1DBuffer);
-}
-REGISTER_TEST(1DbufferTo1D)
-{
-    return test_image_set(device, context, queue, k1DBufferTo1D);
-}
-REGISTER_TEST(1Darray)
-{
-    return test_image_set( device, context, queue, k1DArray );
-}
-REGISTER_TEST(2Darray)
-{
-    return test_image_set( device, context, queue, k2DArray );
-}
-REGISTER_TEST(2Dto3D)
-{
-    return test_image_set( device, context, queue, k2DTo3D );
-}
-REGISTER_TEST(3Dto2D)
-{
-    return test_image_set( device, context, queue, k3DTo2D );
-}
-REGISTER_TEST(2Darrayto2D)
-{
-    return test_image_set( device, context, queue, k2DArrayTo2D );
-}
-REGISTER_TEST(2Dto2Darray)
-{
-    return test_image_set( device, context, queue, k2DTo2DArray );
-}
-REGISTER_TEST(2Darrayto3D)
-{
-    return test_image_set( device, context, queue, k2DArrayTo3D );
-}
-REGISTER_TEST(3Dto2Darray)
-{
-    return test_image_set( device, context, queue, k3DTo2DArray );
+    return test_image_type(device, context, queue, test_configs[(uintptr_t)arg],
+                           ctx);
 }
 
 static test_status parseArgs(int &argc, const char *argv[],
@@ -91,11 +44,12 @@ static test_status parseArgs(int &argc, const char *argv[],
         use_pitches - Enables row and slice pitches
 )";
 
-    cl_channel_type chanType;
     cl_channel_order chanOrder;
 
     std::vector<const char *> argList;
     argList.push_back(argv[0]);
+
+    init_context(ctx);
 
     // Parse arguments
     for (int i = 1; i < argc; i++)
@@ -103,24 +57,21 @@ static test_status parseArgs(int &argc, const char *argv[],
         removed_args.push_back(argv[i]);
         if (strcmp(argv[i], "test_mipmaps") == 0)
         {
-            gTestMipmaps = true;
+            ctx.testMipmaps = true;
             // Don't test pitches with mipmaps, at least currently.
-            gEnablePitch = false;
+            ctx.enablePitch = false;
         }
         else if (strcmp(argv[i], "debug_trace") == 0)
-            gDebugTrace = true;
+            ctx.debugTrace = true;
         else if (strcmp(argv[i], "small_images") == 0)
-            gTestSmallImages = true;
+            ctx.testSmallImages = true;
         else if (strcmp(argv[i], "max_images") == 0)
-            gTestMaxImages = true;
+            ctx.testMaxImages = true;
         else if (strcmp(argv[i], "use_pitches") == 0)
-            gEnablePitch = true;
-        else if ((chanType = get_channel_type_from_name(argv[i]))
-                 != (cl_channel_type)-1)
-            gChannelTypeToUse = chanType;
+            ctx.enablePitch = true;
         else if ((chanOrder = get_channel_order_from_name(argv[i]))
                  != (cl_channel_order)-1)
-            gChannelOrderToUse = chanOrder;
+            ctx.channelOrderToUse = chanOrder;
         else
         {
             removed_args.pop_back();
@@ -128,16 +79,167 @@ static test_status parseArgs(int &argc, const char *argv[],
         }
     }
 
-    if (gTestSmallImages) log_info("Note: Using small test images\n");
+    if (ctx.testSmallImages) log_info("Note: Using small test images\n");
 
     update_argc_argv_from_args_list(argList, argc, argv);
+
+    for (auto channel_type : channel_types)
+    {
+        for (auto testMethod :
+             { k1D, k2D, k3D, k1DBuffer, k1DTo1DBuffer, k1DBufferTo1D, k1DArray,
+               k2DArray, k2DTo3D, k3DTo2D, k2DArrayTo2D, k2DTo2DArray,
+               k2DArrayTo3D, k3DTo2DArray })
+        {
+            switch (testMethod)
+            {
+                case k1D:
+                    test_configs.emplace_back(
+                        "1D", CL_MEM_OBJECT_IMAGE1D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE1D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_1D, channel_type);
+                    break;
+                case k2D:
+                    test_configs.emplace_back(
+                        "2D", CL_MEM_OBJECT_IMAGE2D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE2D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_2D, channel_type);
+                    break;
+                case k3D:
+                    test_configs.emplace_back(
+                        "3D", CL_MEM_OBJECT_IMAGE3D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE3D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_3D, channel_type);
+                    break;
+                case k1DArray:
+                    test_configs.emplace_back(
+                        "1Darray", CL_MEM_OBJECT_IMAGE1D_ARRAY,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE1D_ARRAY,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_1D_array, channel_type);
+                    break;
+                case k2DArray:
+                    test_configs.emplace_back(
+                        "2Darray", CL_MEM_OBJECT_IMAGE2D_ARRAY,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE2D_ARRAY,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_2D_array, channel_type);
+                    break;
+                case k2DTo3D:
+                    test_configs.emplace_back(
+                        "2DTo3D", CL_MEM_OBJECT_IMAGE2D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE3D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_2D_3D, channel_type);
+                    break;
+                case k3DTo2D:
+                    test_configs.emplace_back(
+                        "3DTo2D", CL_MEM_OBJECT_IMAGE3D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE2D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_2D_3D, channel_type);
+                    break;
+                case k2DArrayTo2D:
+                    test_configs.emplace_back(
+                        "2DArrayTo2D", CL_MEM_OBJECT_IMAGE2D_ARRAY,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE2D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_2D_2D_array, channel_type);
+                    break;
+                case k2DTo2DArray:
+                    test_configs.emplace_back(
+                        "2DTo2DArray", CL_MEM_OBJECT_IMAGE2D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE2D_ARRAY,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_2D_2D_array, channel_type);
+                    break;
+                case k2DArrayTo3D:
+                    test_configs.emplace_back(
+                        "2DArrayTo3D", CL_MEM_OBJECT_IMAGE2D_ARRAY,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE3D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_3D_2D_array, channel_type);
+                    break;
+                case k3DTo2DArray:
+                    test_configs.emplace_back(
+                        "3DTo2DArray", CL_MEM_OBJECT_IMAGE3D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE2D_ARRAY,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_3D_2D_array, channel_type);
+                    break;
+                case k1DBuffer:
+                    test_configs.emplace_back(
+                        "1DBuffer", CL_MEM_OBJECT_IMAGE1D_BUFFER,
+                        CL_MEM_READ_ONLY, CL_MEM_OBJECT_IMAGE1D_BUFFER,
+                        CL_MEM_READ_ONLY, test_copy_image_set_1D_buffer,
+                        channel_type);
+                    break;
+                case k1DTo1DBuffer:
+                    test_configs.emplace_back(
+                        "1DTo1DBuffer", CL_MEM_OBJECT_IMAGE1D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        CL_MEM_OBJECT_IMAGE1D_BUFFER, CL_MEM_READ_ONLY,
+                        test_copy_image_set_1D_1D_buffer, channel_type);
+                    break;
+                case k1DBufferTo1D:
+                    test_configs.emplace_back(
+                        "1DBufferTo1D", CL_MEM_OBJECT_IMAGE1D_BUFFER,
+                        CL_MEM_READ_ONLY, CL_MEM_OBJECT_IMAGE1D,
+                        ctx.enablePitch ? CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY
+                                        : CL_MEM_READ_ONLY,
+                        test_copy_image_set_1D_1D_buffer, channel_type);
+                    break;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < test_configs.size(); i++)
+    {
+        test_registry::getInstance().add_test(
+            test_image_set, test_configs[i].name.c_str(), Version(1, 2),
+            (void *)(uintptr_t)i);
+    }
+
     return TEST_PASS;
 }
 
 int main(int argc, const char *argv[])
 {
-    return runTestHarnessWithCheckAndParse(
-        argc, argv, test_registry::getInstance().num_tests(),
-        test_registry::getInstance().definitions(), false, 0,
-        verifyImageSupport, parseArgs);
+    return runTestHarnessWithCheckAndParse(argc, argv, false, 0,
+                                           verifyImageSupport, parseArgs);
 }

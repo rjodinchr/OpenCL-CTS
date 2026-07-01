@@ -16,7 +16,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include "../testBase.h"
+#include "../common.h"
 #include "../harness/compat.h"
 #include "../harness/fpcontrol.h"
 
@@ -27,40 +27,18 @@
 __thread fpu_control_t fpu_control = 0;
 #endif
 
-bool                gTestReadWrite;
-bool                gDebugTrace;
-bool                gTestMaxImages;
-bool                gTestSmallImages;
-int                 gTypesToTest;
-cl_channel_type     gChannelTypeToUse = (cl_channel_type)-1;
-cl_channel_order    gChannelOrderToUse = (cl_channel_order)-1;
-bool                gEnablePitch = false;
+extern int test_image_set(cl_device_id device, cl_context context,
+                          cl_command_queue queue, cl_mem_object_type imageType,
+                          cl_channel_type channel_type, const context_t &ctx);
 
-extern int test_image_set( cl_device_id device, cl_context context, cl_command_queue queue, cl_mem_object_type imageType );
-
-REGISTER_TEST(1D)
+static context_t ctx;
+static std::vector<struct test_configs> test_configs;
+static int doTest(cl_device_id device, cl_context context,
+                  cl_command_queue queue, int, void *args)
 {
-    return test_image_set(device, context, queue, CL_MEM_OBJECT_IMAGE1D);
-}
-REGISTER_TEST(1Dbuffer)
-{
-    return test_image_set(device, context, queue, CL_MEM_OBJECT_IMAGE1D_BUFFER);
-}
-REGISTER_TEST(2D)
-{
-    return test_image_set( device, context, queue, CL_MEM_OBJECT_IMAGE2D );
-}
-REGISTER_TEST(3D)
-{
-    return test_image_set( device, context, queue, CL_MEM_OBJECT_IMAGE3D );
-}
-REGISTER_TEST(1Darray)
-{
-    return test_image_set( device, context, queue, CL_MEM_OBJECT_IMAGE1D_ARRAY );
-}
-REGISTER_TEST(2Darray)
-{
-    return test_image_set( device, context, queue, CL_MEM_OBJECT_IMAGE2D_ARRAY );
+    auto &test = test_configs[(uintptr_t)args];
+    return test_image_set(device, context, queue, test.imageType,
+                          test.channel_type, ctx);
 }
 
 static test_status parseArgs(int &argc, const char *argv[],
@@ -85,39 +63,37 @@ static test_status parseArgs(int &argc, const char *argv[],
         use_pitches - Enables row and slice pitches
 )";
 
-    cl_channel_type chanType;
     cl_channel_order chanOrder;
 
     std::vector<const char *> argList;
     argList.push_back(argv[0]);
+
+    init_context(ctx);
 
     // Parse arguments
     for ( int i = 1; i < argc; i++ )
     {
         removed_args.push_back(argv[i]);
         if ( strcmp( argv[i], "debug_trace" ) == 0 )
-            gDebugTrace = true;
+            ctx.debugTrace = true;
         else if ( strcmp( argv[i], "read_write" ) == 0 )
-            gTestReadWrite = true;
+            ctx.testReadWrite = true;
         else if ( strcmp( argv[i], "small_images" ) == 0 )
-            gTestSmallImages = true;
+            ctx.testSmallImages = true;
         else if ( strcmp( argv[i], "max_images" ) == 0 )
-            gTestMaxImages = true;
+            ctx.testMaxImages = true;
         else if ( strcmp( argv[i], "use_pitches" ) == 0 )
-            gEnablePitch = true;
+            ctx.enablePitch = true;
 
         else if ( strcmp( argv[i], "int" ) == 0 )
-            gTypesToTest |= kTestInt;
+            ctx.typesToTest |= kTestInt;
         else if ( strcmp( argv[i], "uint" ) == 0 )
-            gTypesToTest |= kTestUInt;
+            ctx.typesToTest |= kTestUInt;
         else if ( strcmp( argv[i], "float" ) == 0 )
-            gTypesToTest |= kTestFloat;
-
-        else if ( ( chanType = get_channel_type_from_name( argv[i] ) ) != (cl_channel_type)-1 )
-            gChannelTypeToUse = chanType;
+            ctx.typesToTest |= kTestFloat;
 
         else if ( ( chanOrder = get_channel_order_from_name( argv[i] ) ) != (cl_channel_order)-1 )
-            gChannelOrderToUse = chanOrder;
+            ctx.channelOrderToUse = chanOrder;
         else
         {
             removed_args.pop_back();
@@ -125,13 +101,22 @@ static test_status parseArgs(int &argc, const char *argv[],
         }
     }
 
-    if ( gTypesToTest == 0 )
-        gTypesToTest = kTestAllTypes;
+    if (ctx.typesToTest == 0) ctx.typesToTest = kTestAllTypes;
 
-    if ( gTestSmallImages )
-        log_info( "Note: Using small test images\n" );
+    if (ctx.testSmallImages) log_info("Note: Using small test images\n");
 
     update_argc_argv_from_args_list(argList, argc, argv);
+
+    std::vector<struct image_type> image_types = {
+        { CL_MEM_OBJECT_IMAGE1D, "1D" },
+        { CL_MEM_OBJECT_IMAGE2D, "2D" },
+        { CL_MEM_OBJECT_IMAGE3D, "3D" },
+        { CL_MEM_OBJECT_IMAGE1D_ARRAY, "1Darray" },
+        { CL_MEM_OBJECT_IMAGE2D_ARRAY, "2Darray" },
+        { CL_MEM_OBJECT_IMAGE1D_BUFFER, "1Dbuffer" },
+    };
+    register_test_configs(image_types, test_configs, doTest);
+
     return TEST_PASS;
 }
 
@@ -149,10 +134,8 @@ int main(int argc, const char *argv[])
     FPU_mode_type oldMode;
     DisableFTZ(&oldMode);
 
-    int ret = runTestHarnessWithCheckAndParse(
-        argc, argv, test_registry::getInstance().num_tests(),
-        test_registry::getInstance().definitions(), false, 0,
-        verifyImageSupport, parseArgs);
+    int ret = runTestHarnessWithCheckAndParse(argc, argv, false, 0,
+                                              verifyImageSupport, parseArgs);
 
     // Restore FP state before leaving
     RestoreFPState(&oldMode);

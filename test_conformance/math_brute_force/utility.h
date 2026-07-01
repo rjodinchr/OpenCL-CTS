@@ -26,7 +26,7 @@
 #include "harness/parseParameters.h"
 #include "CL/cl_half.h"
 
-#define BUFFER_SIZE (1024 * 1024 * 2)
+#define BUFFER_SIZE (1024 * 1024 * 8)
 #define EMBEDDED_REDUCTION_FACTOR (64)
 
 #if defined(__GNUC__)
@@ -43,21 +43,186 @@ extern int gWimpyReductionFactor;
 extern const char *sizeNames[VECTOR_SIZE_COUNT];
 extern const int sizeValues[VECTOR_SIZE_COUNT];
 
+#include <mutex>
+#include <queue>
+#include <cstdlib>
+#include <alloc.h>
+
+struct MathResources
+{
+    void *in = nullptr;
+    void *in2 = nullptr;
+    void *in3 = nullptr;
+    void *out_ref = nullptr;
+    void *out[VECTOR_SIZE_COUNT] = {};
+    void *out_ref2 = nullptr;
+    void *out2[VECTOR_SIZE_COUNT] = {};
+    cl_mem inBuffer = nullptr;
+    cl_mem inBuffer2 = nullptr;
+    cl_mem inBuffer3 = nullptr;
+    cl_mem outBuffer[VECTOR_SIZE_COUNT] = {};
+    cl_mem outBuffer2[VECTOR_SIZE_COUNT] = {};
+    cl_command_queue queue = nullptr;
+    MTdataHolder d;
+};
+
+extern thread_local MathResources *gThreadResources;
+extern MathResources *gActiveThreadPoolResources;
+
+#define gQueue                                                                 \
+    (gThreadResources ? gThreadResources->queue                                \
+                      : gActiveThreadPoolResources->queue)
+#define gIn                                                                    \
+    (gThreadResources ? gThreadResources->in : gActiveThreadPoolResources->in)
+#define gIn2                                                                   \
+    (gThreadResources ? gThreadResources->in2 : gActiveThreadPoolResources->in2)
+#define gIn3                                                                   \
+    (gThreadResources ? gThreadResources->in3 : gActiveThreadPoolResources->in3)
+#define gOut_Ref                                                               \
+    (gThreadResources ? gThreadResources->out_ref                              \
+                      : gActiveThreadPoolResources->out_ref)
+#define gOut_Ref2                                                              \
+    (gThreadResources ? gThreadResources->out_ref2                             \
+                      : gActiveThreadPoolResources->out_ref2)
+#define gOut                                                                   \
+    (gThreadResources ? gThreadResources->out : gActiveThreadPoolResources->out)
+#define gOut2                                                                  \
+    (gThreadResources ? gThreadResources->out2                                 \
+                      : gActiveThreadPoolResources->out2)
+#define gInBuffer                                                              \
+    (gThreadResources ? gThreadResources->inBuffer                             \
+                      : gActiveThreadPoolResources->inBuffer)
+#define gInBuffer2                                                             \
+    (gThreadResources ? gThreadResources->inBuffer2                            \
+                      : gActiveThreadPoolResources->inBuffer2)
+#define gInBuffer3                                                             \
+    (gThreadResources ? gThreadResources->inBuffer3                            \
+                      : gActiveThreadPoolResources->inBuffer3)
+#define gOutBuffer                                                             \
+    (gThreadResources ? gThreadResources->outBuffer                            \
+                      : gActiveThreadPoolResources->outBuffer)
+#define gOutBuffer2                                                            \
+    (gThreadResources ? gThreadResources->outBuffer2                           \
+                      : gActiveThreadPoolResources->outBuffer2)
+
+#define gMTdata                                                                \
+    (gThreadResources ? gThreadResources->d : gActiveThreadPoolResources->d)
+
+cl_int MathThreadPool_Do(TPFuncPtr func_ptr, cl_uint count, void *userInfo,
+                         MathResources *res);
+#define ThreadPool_Do(func, count, arg)                                        \
+    MathThreadPool_Do(func, count, arg, gThreadResources)
+
+class MathResourcesPool {
+public:
+    MathResources Acquire(cl_context context, cl_device_id device)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        MathResources res;
+        if (pool_.empty())
+        {
+            cl_uint min_alignment = 0;
+            clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN,
+                            sizeof(cl_uint), (void *)&min_alignment, NULL);
+            min_alignment >>= 3; // convert bits to bytes
+
+            cl_device_type device_type;
+            clGetDeviceInfo(device, CL_DEVICE_TYPE, sizeof(device_type),
+                            &device_type, NULL);
+
+            res.in = align_malloc(BUFFER_SIZE, min_alignment);
+            res.in2 = align_malloc(BUFFER_SIZE, min_alignment);
+            res.in3 = align_malloc(BUFFER_SIZE, min_alignment);
+            res.out_ref = align_malloc(BUFFER_SIZE, min_alignment);
+            res.out_ref2 = align_malloc(BUFFER_SIZE, min_alignment);
+            for (int j = 0; j < VECTOR_SIZE_COUNT; ++j)
+            {
+                res.out[j] = align_malloc(BUFFER_SIZE, min_alignment);
+                res.out2[j] = align_malloc(BUFFER_SIZE, min_alignment);
+            }
+
+            cl_int error;
+            cl_mem_flags device_flags = CL_MEM_READ_ONLY;
+            if (device_type == CL_DEVICE_TYPE_CPU)
+                device_flags |= CL_MEM_USE_HOST_PTR;
+            else
+                device_flags |= CL_MEM_COPY_HOST_PTR;
+
+            res.inBuffer = clCreateBuffer(context, device_flags, BUFFER_SIZE,
+                                          res.in, &error);
+            res.inBuffer2 = clCreateBuffer(context, device_flags, BUFFER_SIZE,
+                                           res.in2, &error);
+            res.inBuffer3 = clCreateBuffer(context, device_flags, BUFFER_SIZE,
+                                           res.in3, &error);
+
+            device_flags = CL_MEM_READ_WRITE;
+            if (device_type == CL_DEVICE_TYPE_CPU)
+                device_flags |= CL_MEM_USE_HOST_PTR;
+            else
+                device_flags |= CL_MEM_COPY_HOST_PTR;
+
+            for (int j = 0; j < VECTOR_SIZE_COUNT; ++j)
+            {
+                res.outBuffer[j] = clCreateBuffer(
+                    context, device_flags, BUFFER_SIZE, res.out[j], &error);
+                res.outBuffer2[j] = clCreateBuffer(
+                    context, device_flags, BUFFER_SIZE, res.out2[j], &error);
+            }
+
+            res.queue = clCreateCommandQueue(context, device, 0, &error);
+        }
+        else
+        {
+            res = std::move(pool_.front());
+            pool_.pop();
+        }
+
+        res.d = MTdataHolder(gRandomSeed);
+        return res;
+    }
+
+    void Release(MathResources &res)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pool_.push(std::move(res));
+    }
+
+    void ReleaseAll()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        while (!pool_.empty())
+        {
+            MathResources res = std::move(pool_.front());
+            pool_.pop();
+            clReleaseMemObject(res.inBuffer);
+            clReleaseMemObject(res.inBuffer2);
+            clReleaseMemObject(res.inBuffer3);
+            for (int j = 0; j < VECTOR_SIZE_COUNT; ++j)
+            {
+                clReleaseMemObject(res.outBuffer[j]);
+                clReleaseMemObject(res.outBuffer2[j]);
+            }
+            clReleaseCommandQueue(res.queue);
+            align_free(res.in);
+            align_free(res.in2);
+            align_free(res.in3);
+            align_free(res.out_ref);
+            align_free(res.out_ref2);
+            for (int j = 0; j < VECTOR_SIZE_COUNT; ++j)
+            {
+                align_free(res.out[j]);
+                align_free(res.out2[j]);
+            }
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::queue<MathResources> pool_;
+};
+
 extern cl_device_id gDevice;
 extern cl_context gContext;
-extern cl_command_queue gQueue;
-extern void *gIn;
-extern void *gIn2;
-extern void *gIn3;
-extern void *gOut_Ref;
-extern void *gOut_Ref2;
-extern void *gOut[VECTOR_SIZE_COUNT];
-extern void *gOut2[VECTOR_SIZE_COUNT];
-extern cl_mem gInBuffer;
-extern cl_mem gInBuffer2;
-extern cl_mem gInBuffer3;
-extern cl_mem gOutBuffer[VECTOR_SIZE_COUNT];
-extern cl_mem gOutBuffer2[VECTOR_SIZE_COUNT];
 extern int gSkipCorrectnessTesting;
 extern int gForceFTZ;
 extern int gFastRelaxedDerived;
@@ -77,6 +242,8 @@ extern cl_device_fp_config gDoubleCapabilities;
 extern RoundingMode gFloatToHalfRoundingMode;
 
 extern cl_half_rounding_mode gHalfRoundingMode;
+
+extern bool gTestAll;
 
 #define HFF(num) cl_half_from_float(num, gHalfRoundingMode)
 #define HFD(num) cl_half_from_double(num, gHalfRoundingMode)
@@ -98,25 +265,21 @@ float Abs_Error(float test, double reference);
 float Ulp_Error(float test, double reference);
 float Bruteforce_Ulp_Error_Double(double test, long double reference);
 
-// used to convert a bucket of bits into a search pattern through double
-inline double DoubleFromUInt32(uint32_t bits)
+extern MathResourcesPool gResourcesPool;
+struct ResourceGuard
 {
-    union {
-        uint64_t u;
-        double d;
-    } u;
-
-    // split 0x89abcdef to 0x89abc00000000def
-    u.u = bits & 0xfffU;
-    u.u |= (uint64_t)(bits & ~0xfffU) << 32;
-
-    // sign extend the leading bit of def segment as sign bit so that the middle
-    // region consists of either all 1s or 0s
-    u.u -= (bits & 0x800U) << 1;
-
-    // return result
-    return u.d;
-}
+    MathResources res;
+    ResourceGuard()
+    {
+        res = gResourcesPool.Acquire(gContext, gDevice);
+        gThreadResources = &res;
+    }
+    ~ResourceGuard()
+    {
+        gResourcesPool.Release(res);
+        gThreadResources = nullptr;
+    }
+};
 
 // The spec is fairly clear that we may enforce a hard cutoff to prevent
 // premature flushing to zero.
@@ -251,36 +414,9 @@ void logFunctionInfo(const char *fname, unsigned int float_size,
 
 float getAllowedUlpError(const Func *f, Type t, const bool relaxed);
 
-inline cl_uint getTestScale(size_t typeSize)
-{
-    if (gWimpyMode)
-    {
-        return (cl_uint)typeSize * 2 * gWimpyReductionFactor;
-    }
-    else if (gIsEmbedded)
-    {
-        return EMBEDDED_REDUCTION_FACTOR;
-    }
-    else
-    {
-        return 1;
-    }
-}
-
 inline uint64_t getTestStep(size_t typeSize, size_t bufferSize)
 {
-    if (gWimpyMode)
-    {
-        return (1ULL << 32) * gWimpyReductionFactor / (512);
-    }
-    else if (gIsEmbedded)
-    {
-        return (BUFFER_SIZE / typeSize) * EMBEDDED_REDUCTION_FACTOR;
-    }
-    else
-    {
-        return bufferSize / typeSize;
-    }
+    return bufferSize / typeSize;
 }
 
 #endif /* UTILITY_H */

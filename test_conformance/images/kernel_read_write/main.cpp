@@ -16,7 +16,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include "../testBase.h"
+#include "../common.h"
 #include "../harness/compat.h"
 #include "../harness/fpcontrol.h"
 
@@ -27,28 +27,13 @@
 __thread fpu_control_t fpu_control = 0;
 #endif
 
-bool gDebugTrace;
-bool gExtraValidateInfo;
-bool gDisableOffsets;
-bool gTestSmallImages;
-bool gTestMaxImages;
-bool gTestImage2DFromBuffer;
-bool gTestMipmaps;
-cl_filter_mode    gFilterModeToUse = (cl_filter_mode)-1;
-// Default is CL_MEM_USE_HOST_PTR for the test
-cl_mem_flags    gMemFlagsToUse = CL_MEM_USE_HOST_PTR;
-bool            gUseKernelSamplers = false;
-int                gTypesToTest = 0;
-cl_addressing_mode gAddressModeToUse = (cl_addressing_mode)-1;
-int             gNormalizedModeToUse = 7;
-cl_channel_type gChannelTypeToUse = (cl_channel_type)-1;
-cl_channel_order gChannelOrderToUse = (cl_channel_order)-1;
-bool            gEnablePitch = false;
+static context_t ctx;
 
-int             gtestTypesToRun = 0;
-static int testTypesToRun;
-
-extern int test_image_set( cl_device_id device, cl_context context, cl_command_queue queue, test_format_set_fn formatTestFn, cl_mem_object_type imageType );
+extern int test_image_set(cl_device_id device, cl_context context,
+                          cl_command_queue queue,
+                          test_format_set_fn formatTestFn,
+                          cl_mem_object_type imageType,
+                          cl_channel_type channel_type, const context_t &ctx);
 
 extern int cl_image_requirements_size_ext_negative(cl_device_id device,
                                                    cl_context context,
@@ -87,199 +72,163 @@ extern int image_from_buffer_read_positive(cl_device_id device,
                                            cl_context context,
                                            cl_command_queue queue);
 extern int ext_image_raw10_raw12(cl_device_id device, cl_context context,
-                                 cl_command_queue queue);
+                                 cl_command_queue queue, const context_t &ctx);
 
-/** read_write images only support sampler-less read buildt-ins which require special settings
-  * for some global parameters. This pair of functions temporarily overwrite those global parameters
-  * and then recover them after completing a read_write test.
-  */
-static void overwrite_global_params_for_read_write_test(  bool            *tTestMipmaps,
-                                                            bool            *tDisableOffsets,
-                                                            bool            *tNormalizedModeToUse,
-                                                            cl_filter_mode  *tFilterModeToUse)
-{
-    log_info("Overwrite global settings for read_write image tests. The overwritten values:\n");
-    log_info("gTestMipmaps = false, gDisableOffsets = true, gNormalizedModeToUse = false, gFilterModeToUse = CL_FILTER_NEAREST\n" );
-    // mipmap images only support sampler read built-in while read_write images only support
-    // sampler-less read built-in. Hence we cannot test mipmap for read_write image.
-    *tTestMipmaps = gTestMipmaps;
-    gTestMipmaps = false;
-
-    // Read_write images are read by sampler-less read which does not handle out-of-bound read
-    // It's application responsibility to make sure that the read happens in-bound
-    // Therefore we should not enable offset in testing read_write images because it will cause out-of-bound
-    *tDisableOffsets    = gDisableOffsets;
-    gDisableOffsets     = true;
-
-    // The sampler-less read image functions behave exactly as the corresponding read image functions
-
-
-    *tNormalizedModeToUse   = gNormalizedModeToUse;
-    gNormalizedModeToUse    = false;
-    *tFilterModeToUse       = gFilterModeToUse;
-    gFilterModeToUse        = CL_FILTER_NEAREST;
-}
-
-/** Recover the global settings overwritten for read_write tests. This is necessary because
-  * there may be other tests (i.e. read or write) are called together with read_write test.
-  */
-static void recover_global_params_from_read_write_test(bool            tTestMipmaps,
-                                                         bool            tDisableOffsets,
-                                                         bool            tNormalizedModeToUse,
-                                                         cl_filter_mode  tFilterModeToUse)
-{
-    gTestMipmaps            = tTestMipmaps;
-    gDisableOffsets         = tDisableOffsets;
-    gNormalizedModeToUse    = tNormalizedModeToUse;
-    gFilterModeToUse        = tFilterModeToUse;
-}
-
-static int doTest( cl_device_id device, cl_context context, cl_command_queue queue, cl_mem_object_type imageType )
+static int doTest(cl_device_id device, cl_context context,
+                  cl_command_queue queue, cl_mem_object_type imageType,
+                  cl_channel_type channel_type, const context_t &ctx)
 {
     int ret = 0;
     bool is_2d_image = imageType == CL_MEM_OBJECT_IMAGE2D;
-    bool            tTestMipMaps = false;
-    bool            tDisableOffsets = false;
-    bool            tNormalizedModeToUse = false;
-    cl_filter_mode  tFilterModeToUse = (cl_filter_mode)-1;
 
-    if( testTypesToRun & kReadTests )
+    if (ctx.testTypesToRun & kReadTests)
     {
-        gtestTypesToRun = kReadTests;
-        ret += test_image_set( device, context, queue, test_read_image_formats, imageType );
+        context_t sub_ctx = ctx;
+        sub_ctx.testTypesToRun = kReadTests;
+        ret += test_image_set(device, context, queue, test_read_image_formats,
+                              imageType, channel_type, sub_ctx);
 
         if( is_2d_image && is_extension_available( device, "cl_khr_image2d_from_buffer" ) )
         {
             log_info( "Testing read_image{f | i | ui} for 2D image from buffer\n" );
 
-            // NOTE: for 2D image from buffer test, gTestSmallImages, gTestMaxImages, gTestRounding and gTestMipmaps must be false
-            if( gTestSmallImages == false && gTestMaxImages == false && gTestRounding == false && gTestMipmaps == false )
+            // NOTE: for 2D image from buffer test, ctx.testSmallImages,
+            // ctx.testMaxImages, gTestRounding and ctx.testMipmaps must be
+            // false
+            if (ctx.testSmallImages == false && ctx.testMaxImages == false
+                && gTestRounding == false && ctx.testMipmaps == false)
             {
-                cl_mem_flags saved_gMemFlagsToUse = gMemFlagsToUse;
-                gTestImage2DFromBuffer = true;
 
-                // disable CL_MEM_USE_HOST_PTR for 1.2 extension but enable this for 2.0
-                gMemFlagsToUse = CL_MEM_COPY_HOST_PTR;
+                sub_ctx.testImage2DFromBuffer = true;
+                // disable CL_MEM_USE_HOST_PTR for 1.2 extension but enable this
+                // for 2.0
+                sub_ctx.memFlagsToUse = CL_MEM_COPY_HOST_PTR;
 
-                ret += test_image_set( device, context, queue, test_read_image_formats, imageType );
-
-                gTestImage2DFromBuffer = false;
-                gMemFlagsToUse = saved_gMemFlagsToUse;
+                ret += test_image_set(device, context, queue,
+                                      test_read_image_formats, imageType,
+                                      channel_type, sub_ctx);
             }
         }
     }
 
-    if( testTypesToRun & kWriteTests )
+    if (ctx.testTypesToRun & kWriteTests)
     {
-        gtestTypesToRun = kWriteTests;
-        ret += test_image_set( device, context, queue, test_write_image_formats, imageType );
+        context_t sub_ctx = ctx;
+        sub_ctx.testTypesToRun = kWriteTests;
+        ret += test_image_set(device, context, queue, test_write_image_formats,
+                              imageType, channel_type, sub_ctx);
 
         if( is_2d_image && is_extension_available( device, "cl_khr_image2d_from_buffer" ) )
         {
             log_info( "Testing write_image{f | i | ui} for 2D image from buffer\n" );
 
-            // NOTE: for 2D image from buffer test, gTestSmallImages, gTestMaxImages,gTestRounding and gTestMipmaps must be false
-            if( gTestSmallImages == false && gTestMaxImages == false && gTestRounding == false && gTestMipmaps == false )
+            // NOTE: for 2D image from buffer test, ctx.testSmallImages,
+            // ctx.testMaxImages,gTestRounding and ctx.testMipmaps must be false
+            if (ctx.testSmallImages == false && ctx.testMaxImages == false
+                && gTestRounding == false && ctx.testMipmaps == false)
             {
-                bool saved_gEnablePitch = gEnablePitch;
-                cl_mem_flags saved_gMemFlagsToUse = gMemFlagsToUse;
-                gEnablePitch = true;
+                sub_ctx.enablePitch = true;
 
                 // disable CL_MEM_USE_HOST_PTR for 1.2 extension but enable this for 2.0
-                gMemFlagsToUse = CL_MEM_COPY_HOST_PTR;
-                gTestImage2DFromBuffer = true;
+                sub_ctx.memFlagsToUse = CL_MEM_COPY_HOST_PTR;
+                sub_ctx.testImage2DFromBuffer = true;
 
-                ret += test_image_set( device, context, queue, test_write_image_formats, imageType );
-
-                gTestImage2DFromBuffer = false;
-                gMemFlagsToUse = saved_gMemFlagsToUse;
-                gEnablePitch = saved_gEnablePitch;
+                ret += test_image_set(device, context, queue,
+                                      test_write_image_formats, imageType,
+                                      channel_type, sub_ctx);
             }
         }
     }
 
-    if ((testTypesToRun & kReadWriteTests)
+    if ((ctx.testTypesToRun & kReadWriteTests)
         && checkForReadWriteImageSupport(device))
     {
         return ret;
     }
 
-    if( ( testTypesToRun & kReadWriteTests ) && !gTestMipmaps )
+    if ((ctx.testTypesToRun & kReadWriteTests) && !ctx.testMipmaps)
     {
-        gtestTypesToRun = kReadWriteTests;
-        overwrite_global_params_for_read_write_test(&tTestMipMaps, &tDisableOffsets, &tNormalizedModeToUse, &tFilterModeToUse);
-        ret += test_image_set( device, context, queue, test_read_image_formats, imageType );
+        context_t sub_ctx = ctx;
+        sub_ctx.testTypesToRun = kReadWriteTests;
+        // mipmap images only support sampler read built-in while read_write
+        // images only support sampler-less read built-in. Hence we cannot test
+        // mipmap for read_write image.
+        sub_ctx.testMipmaps = false;
+        // Read_write images are read by sampler-less read which does not handle
+        // out-of-bound read It's application responsibility to make sure that
+        // the read happens in-bound Therefore we should not enable offset in
+        // testing read_write images because it will cause out-of-bound
+        sub_ctx.disableOffsets = true;
+        // The sampler-less read image functions behave exactly as the
+        // corresponding read image functions
+        sub_ctx.normalizedModeToUse = false;
+        sub_ctx.filterModeToUse = CL_FILTER_NEAREST;
+
+        ret += test_image_set(device, context, queue, test_read_image_formats,
+                              imageType, channel_type, sub_ctx);
 
         if( is_2d_image && is_extension_available( device, "cl_khr_image2d_from_buffer" ) )
         {
-            log_info("Testing read_image{f | i | ui} for 2D image from buffer\n");
-
-            // NOTE: for 2D image from buffer test, gTestSmallImages, gTestMaxImages, gTestRounding and gTestMipmaps must be false
-            if( gTestSmallImages == false && gTestMaxImages == false && gTestRounding == false && gTestMipmaps == false )
+            // NOTE: for 2D image from buffer test, ctx.testSmallImages,
+            // ctx.testMaxImages, gTestRounding and ctx.testMipmaps must be
+            // false
+            if (ctx.testSmallImages == false && ctx.testMaxImages == false
+                && gTestRounding == false && ctx.testMipmaps == false)
             {
-                cl_mem_flags saved_gMemFlagsToUse = gMemFlagsToUse;
-                gTestImage2DFromBuffer = true;
+                log_info("Testing read_image{f | i | ui} for 2D image from "
+                         "buffer\n");
 
-                // disable CL_MEM_USE_HOST_PTR for 1.2 extension but enable this for 2.0
-                gMemFlagsToUse = CL_MEM_COPY_HOST_PTR;
+                context_t sub_sub_ctx = sub_ctx;
+                sub_sub_ctx.testImage2DFromBuffer = true;
 
-                ret += test_image_set( device, context, queue, test_read_image_formats, imageType );
+                // disable CL_MEM_USE_HOST_PTR for 1.2 extension but enable this
+                // for 2.0
+                sub_sub_ctx.memFlagsToUse = CL_MEM_COPY_HOST_PTR;
 
-                gTestImage2DFromBuffer = false;
-                gMemFlagsToUse = saved_gMemFlagsToUse;
+                ret += test_image_set(device, context, queue,
+                                      test_read_image_formats, imageType,
+                                      channel_type, sub_sub_ctx);
             }
         }
 
-        ret += test_image_set( device, context, queue, test_write_image_formats, imageType );
+        ret += test_image_set(device, context, queue, test_write_image_formats,
+                              imageType, channel_type, sub_ctx);
 
         if( is_2d_image && is_extension_available( device, "cl_khr_image2d_from_buffer" ) )
         {
-            log_info("Testing write_image{f | i | ui} for 2D image from buffer\n");
-
-            // NOTE: for 2D image from buffer test, gTestSmallImages, gTestMaxImages,gTestRounding and gTestMipmaps must be false
-            if( gTestSmallImages == false && gTestMaxImages == false && gTestRounding == false && gTestMipmaps == false )
+            // NOTE: for 2D image from buffer test, ctx.testSmallImages,
+            // ctx.testMaxImages,gTestRounding and ctx.testMipmaps must be false
+            if (ctx.testSmallImages == false && ctx.testMaxImages == false
+                && gTestRounding == false && ctx.testMipmaps == false)
             {
-                bool saved_gEnablePitch = gEnablePitch;
-                cl_mem_flags saved_gMemFlagsToUse = gMemFlagsToUse;
-                gEnablePitch = true;
+                log_info("Testing write_image{f | i | ui} for 2D image from "
+                         "buffer\n");
 
-                // disable CL_MEM_USE_HOST_PTR for 1.2 extension but enable this for 2.0
-                gMemFlagsToUse = CL_MEM_COPY_HOST_PTR;
-                gTestImage2DFromBuffer = true;
+                context_t sub_sub_ctx = sub_ctx;
+                sub_sub_ctx.enablePitch = true;
 
-                ret += test_image_set( device, context, queue, test_write_image_formats, imageType );
+                // disable CL_MEM_USE_HOST_PTR for 1.2 extension but enable this
+                // for 2.0
+                sub_sub_ctx.memFlagsToUse = CL_MEM_COPY_HOST_PTR;
+                sub_sub_ctx.testImage2DFromBuffer = true;
 
-                gTestImage2DFromBuffer = false;
-                gMemFlagsToUse = saved_gMemFlagsToUse;
-                gEnablePitch = saved_gEnablePitch;
+                ret += test_image_set(device, context, queue,
+                                      test_write_image_formats, imageType,
+                                      channel_type, sub_sub_ctx);
             }
         }
-
-        recover_global_params_from_read_write_test( tTestMipMaps, tDisableOffsets, tNormalizedModeToUse, tFilterModeToUse );
     }
 
     return ret;
 }
 
-REGISTER_TEST(1D)
+std::vector<struct test_configs> test_configs;
+static int runTest(cl_device_id device, cl_context context,
+                   cl_command_queue queue, int, void *args)
 {
-    return doTest( device, context, queue, CL_MEM_OBJECT_IMAGE1D );
-}
-REGISTER_TEST(2D)
-{
-    return doTest( device, context, queue, CL_MEM_OBJECT_IMAGE2D );
-}
-REGISTER_TEST(3D)
-{
-    return doTest( device, context, queue, CL_MEM_OBJECT_IMAGE3D );
-}
-REGISTER_TEST(1Darray)
-{
-    return doTest( device, context, queue, CL_MEM_OBJECT_IMAGE1D_ARRAY );
-}
-REGISTER_TEST(2Darray)
-{
-    return doTest( device, context, queue, CL_MEM_OBJECT_IMAGE2D_ARRAY );
+    auto &test = test_configs[(uintptr_t)args];
+    return doTest(device, context, queue, test.imageType, test.channel_type,
+                  ctx);
 }
 
 REGISTER_TEST_VERSION(cl_image_requirements_size_ext_negative, Version(3, 0))
@@ -334,7 +283,7 @@ REGISTER_TEST_VERSION(image_from_buffer_read_positive, Version(3, 0))
 
 REGISTER_TEST_VERSION(cl_ext_image_raw10_raw12, Version(1, 2))
 {
-    return ext_image_raw10_raw12(device, context, queue);
+    return ext_image_raw10_raw12(device, context, queue, ctx);
 }
 
 static test_status parseArgs(int &argc, const char *argv[],
@@ -363,7 +312,7 @@ static test_status parseArgs(int &argc, const char *argv[],
         CL_ADDRESS_REPEAT - Only tests formats with CL_ADDRESS_REPEAT addressing
         CL_ADDRESS_MIRRORED_REPEAT - Only tests formats with CL_ADDRESS_MIRRORED_REPEAT addressing
 
-        You may also use appropriate CL_ channel type and ordering constants.
+        You may also use appropriate CL_ channel ordering constants.
 
         local_samplers - Use samplers declared in the kernel functions instead of passed in as arguments
 
@@ -385,93 +334,91 @@ static test_status parseArgs(int &argc, const char *argv[],
         test_mipmaps - Enables mipmapped images
 )";
 
-    cl_channel_type chanType;
     cl_channel_order chanOrder;
 
     std::vector<const char *> argList;
     argList.push_back(argv[0]);
+
+    init_context(ctx);
 
     // Parse arguments
     for( int i = 1; i < argc; i++ )
     {
         removed_args.push_back(argv[i]);
         if( strcmp( argv[i], "debug_trace" ) == 0 )
-            gDebugTrace = true;
+            ctx.debugTrace = true;
 
         else if( strcmp( argv[i], "CL_FILTER_NEAREST" ) == 0 || strcmp( argv[i], "NEAREST" ) == 0 )
-            gFilterModeToUse = CL_FILTER_NEAREST;
+            ctx.filterModeToUse = CL_FILTER_NEAREST;
         else if( strcmp( argv[i], "CL_FILTER_LINEAR" ) == 0 || strcmp( argv[i], "LINEAR" ) == 0 )
-            gFilterModeToUse = CL_FILTER_LINEAR;
+            ctx.filterModeToUse = CL_FILTER_LINEAR;
 
         else if( strcmp( argv[i], "CL_ADDRESS_NONE" ) == 0 )
-            gAddressModeToUse = CL_ADDRESS_NONE;
+            ctx.addressModeToUse = CL_ADDRESS_NONE;
         else if( strcmp( argv[i], "CL_ADDRESS_CLAMP" ) == 0 )
-            gAddressModeToUse = CL_ADDRESS_CLAMP;
+            ctx.addressModeToUse = CL_ADDRESS_CLAMP;
         else if( strcmp( argv[i], "CL_ADDRESS_CLAMP_TO_EDGE" ) == 0 )
-            gAddressModeToUse = CL_ADDRESS_CLAMP_TO_EDGE;
+            ctx.addressModeToUse = CL_ADDRESS_CLAMP_TO_EDGE;
         else if( strcmp( argv[i], "CL_ADDRESS_REPEAT" ) == 0 )
-            gAddressModeToUse = CL_ADDRESS_REPEAT;
+            ctx.addressModeToUse = CL_ADDRESS_REPEAT;
         else if( strcmp( argv[i], "CL_ADDRESS_MIRRORED_REPEAT" ) == 0 )
-            gAddressModeToUse = CL_ADDRESS_MIRRORED_REPEAT;
+            ctx.addressModeToUse = CL_ADDRESS_MIRRORED_REPEAT;
 
         else if( strcmp( argv[i], "NORMALIZED" ) == 0 )
-            gNormalizedModeToUse = true;
+            ctx.normalizedModeToUse = true;
         else if( strcmp( argv[i], "UNNORMALIZED" ) == 0 )
-            gNormalizedModeToUse = false;
+            ctx.normalizedModeToUse = false;
 
 
         else if( strcmp( argv[i], "no_offsets" ) == 0 )
-            gDisableOffsets = true;
+            ctx.disableOffsets = true;
         else if( strcmp( argv[i], "small_images" ) == 0 )
-            gTestSmallImages = true;
+            ctx.testSmallImages = true;
         else if( strcmp( argv[i], "max_images" ) == 0 )
-            gTestMaxImages = true;
+            ctx.testMaxImages = true;
         else if( strcmp( argv[i], "use_pitches" ) == 0 )
-            gEnablePitch = true;
+            ctx.enablePitch = true;
         else if( strcmp( argv[i], "rounding" ) == 0 )
             gTestRounding = true;
         else if( strcmp( argv[i], "extra_validate" ) == 0 )
-            gExtraValidateInfo = true;
+            ctx.extraValidateInfo = true;
         else if( strcmp( argv[i], "test_mipmaps" ) == 0 ) {
             // 2.0 Spec does not allow using mem flags, unnormalized coordinates with mipmapped images
-            gTestMipmaps = true;
-            gMemFlagsToUse = 0;
-            gNormalizedModeToUse = true;
+            ctx.testMipmaps = true;
+            ctx.memFlagsToUse = 0;
+            ctx.normalizedModeToUse = true;
         }
 
         else if( strcmp( argv[i], "read" ) == 0 )
-            testTypesToRun |= kReadTests;
+            ctx.testTypesToRun |= kReadTests;
         else if( strcmp( argv[i], "write" ) == 0 )
-            testTypesToRun |= kWriteTests;
+            ctx.testTypesToRun |= kWriteTests;
         else if( strcmp( argv[i], "read_write" ) == 0 )
         {
-            testTypesToRun |= kReadWriteTests;
+            ctx.testTypesToRun |= kReadWriteTests;
         }
 
         else if( strcmp( argv[i], "local_samplers" ) == 0 )
-            gUseKernelSamplers = true;
+            ctx.useKernelSamplers = true;
 
         else if( strcmp( argv[i], "int" ) == 0 )
-            gTypesToTest |= kTestInt;
+            ctx.typesToTest |= kTestInt;
         else if( strcmp( argv[i], "uint" ) == 0 )
-            gTypesToTest |= kTestUInt;
+            ctx.typesToTest |= kTestUInt;
         else if( strcmp( argv[i], "float" ) == 0 )
-            gTypesToTest |= kTestFloat;
+            ctx.typesToTest |= kTestFloat;
 
         else if( strcmp( argv[i], "CL_MEM_COPY_HOST_PTR" ) == 0 || strcmp( argv[i], "COPY_HOST_PTR" ) == 0 )
-            gMemFlagsToUse = CL_MEM_COPY_HOST_PTR;
+            ctx.memFlagsToUse = CL_MEM_COPY_HOST_PTR;
         else if( strcmp( argv[i], "CL_MEM_USE_HOST_PTR" ) == 0 || strcmp( argv[i], "USE_HOST_PTR" ) == 0 )
-            gMemFlagsToUse = CL_MEM_USE_HOST_PTR;
+            ctx.memFlagsToUse = CL_MEM_USE_HOST_PTR;
         else if( strcmp( argv[i], "CL_MEM_ALLOC_HOST_PTR" ) == 0 || strcmp( argv[i], "ALLOC_HOST_PTR" ) == 0 )
-            gMemFlagsToUse = CL_MEM_ALLOC_HOST_PTR;
+            ctx.memFlagsToUse = CL_MEM_ALLOC_HOST_PTR;
         else if( strcmp( argv[i], "NO_HOST_PTR" ) == 0 )
-            gMemFlagsToUse = 0;
-
-        else if( ( chanType = get_channel_type_from_name( argv[i] ) ) != (cl_channel_type)-1 )
-            gChannelTypeToUse = chanType;
+            ctx.memFlagsToUse = 0;
 
         else if( ( chanOrder = get_channel_order_from_name( argv[i] ) ) != (cl_channel_order)-1 )
-            gChannelOrderToUse = chanOrder;
+            ctx.channelOrderToUse = chanOrder;
         else
         {
             removed_args.pop_back();
@@ -479,15 +426,22 @@ static test_status parseArgs(int &argc, const char *argv[],
         }
     }
 
-    if( testTypesToRun == 0 )
-        testTypesToRun = kAllTests;
-    if( gTypesToTest == 0 )
-        gTypesToTest = kTestAllTypes;
+    if (ctx.testTypesToRun == 0) ctx.testTypesToRun = kAllTests;
+    if (ctx.typesToTest == 0) ctx.typesToTest = kTestAllTypes;
 
-    if( gTestSmallImages )
-        log_info( "Note: Using small test images\n" );
+    if (ctx.testSmallImages) log_info("Note: Using small test images\n");
 
     update_argc_argv_from_args_list(argList, argc, argv);
+
+    std::vector<struct image_type> image_types = {
+        { CL_MEM_OBJECT_IMAGE1D, "1D" },
+        { CL_MEM_OBJECT_IMAGE2D, "2D" },
+        { CL_MEM_OBJECT_IMAGE3D, "3D" },
+        { CL_MEM_OBJECT_IMAGE1D_ARRAY, "1Darray" },
+        { CL_MEM_OBJECT_IMAGE2D_ARRAY, "2Darray" },
+
+    };
+    register_test_configs(image_types, test_configs, runTest);
     return TEST_PASS;
 }
 
@@ -505,10 +459,8 @@ int main(int argc, const char *argv[])
     FPU_mode_type oldMode;
     DisableFTZ(&oldMode);
 
-    int ret = runTestHarnessWithCheckAndParse(
-        argc, argv, test_registry::getInstance().num_tests(),
-        test_registry::getInstance().definitions(), false, 0,
-        verifyImageSupport, parseArgs);
+    int ret = runTestHarnessWithCheckAndParse(argc, argv, false, 0,
+                                              verifyImageSupport, parseArgs);
 
     // Restore FP state before leaving
     RestoreFPState(&oldMode);
