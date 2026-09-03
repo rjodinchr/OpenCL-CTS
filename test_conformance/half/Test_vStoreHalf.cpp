@@ -192,7 +192,7 @@ static cl_int ReferenceD(cl_uint jid, cl_uint tid, void *userInfo)
 
     const auto &specialValues =
         GetFpSpecialValues<double, uint64_t, cl_half, true>();
-    MTdata m = init_genrand(jid);
+    MTdata m = init_genrand((cl_uint)i);
 
 
     uint32_t index;
