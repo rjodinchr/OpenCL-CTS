@@ -1742,10 +1742,15 @@ int Test_vStoreaHalf_private(cl_device_id device, f2h referenceFunc,
     size_t blockCount = BUFFER_SIZE / elementSize;
     uint64_t lastCase = 1ULL << NB_INPUT_POWER_OF_TWO;
 
-    if (gWimpyMode) lastCase /= gWimpyReductionFactor;
+    if (gTestAll)
+    {
+        lastCase = 1ULL << 32;
+    }
+    else if (gWimpyMode)
+    {
+        lastCase /= gWimpyReductionFactor;
+    }
 
-    // we handle 64-bit types a bit differently.
-    if (lastCase == 0) lastCase = 0x100000000ULL;
     uint64_t i, j;
     error = 0;
     uint64_t printMask = (lastCase >> 4) - 1;
