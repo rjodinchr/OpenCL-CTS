@@ -37,8 +37,16 @@
 #include "harness/typeWrappers.h"
 
 #include <memory>
+#include <mutex>
 #include <tuple>
 #include <vector>
+
+#define kVectorSizeCount 6
+#define kMaxVectorSize 16
+#define kPageSize 4096
+
+#define BUFFER_SIZE (1024 * 1024)
+#define EMBEDDED_REDUCTION_FACTOR 16
 
 #if (defined(__arm__) || defined(__aarch64__)) && defined(__GNUC__)
 /* Rounding modes and saturation for use with qcom 64 bit to float conversion
@@ -55,14 +63,6 @@ typedef enum
 
     kSaturationModeCount
 } SaturationMode;
-
-#define kVectorSizeCount 6
-#define kMaxVectorSize 16
-#define kPageSize 4096
-
-#define BUFFER_SIZE (1024 * 1024)
-#define EMBEDDED_REDUCTION_FACTOR 16
-#define PERF_LOOP_COUNT 100
 
 extern const char *gTypeNames[ kTypeCount ];
 extern const char *gRoundingModeNames[ kRoundingModeCount ];        // { "", "_rte", "_rtp", "_rtn", "_rtz" }
@@ -85,11 +85,7 @@ extern CheckResults gCheckResults[ kTypeCount ];
 
 #define kCallStyleCount (kVectorSizeCount + 1 /* for implicit scalar */)
 
-extern MTdata gMTdata;
-extern cl_command_queue gQueue;
 extern cl_context gContext;
-extern cl_mem gInBuffer;
-extern cl_mem gOutBuffers[];
 extern int gHasDouble;
 extern int gTestDouble;
 extern int gHasHalfs;
@@ -99,26 +95,30 @@ extern int gSkipTesting;
 extern int gMinVectorSize;
 extern int gMaxVectorSize;
 extern int gForceFTZ;
-extern int gStartTestNumber;
-extern int gEndTestNumber;
 extern int gIsRTZ;
 extern int gForceHalfFTZ;
 extern int gIsHalfRTZ;
 extern cl_half_rounding_mode gDefaultHalfRoundingMode;
-extern void *gIn;
-extern void *gRef;
-extern void *gAllowZ;
-extern void *gOut[];
 
-extern std::vector<const char *> argList;
+struct buffers
+{
+    void *in;
+    void *ref;
+    void *allowZ;
+    void *out[kCallStyleCount];
+    cl_mem inBuffer;
+    cl_mem outBuffers[kCallStyleCount];
+    cl_command_queue queue;
+};
+extern std::vector<struct buffers> buffers_vec;
 
 extern bool gTestAll;
+extern std::recursive_mutex gLock;
 
 extern const char *sizeNames[];
-extern int vectorSizes[];
+extern const int vectorSizes[];
 
-extern size_t gComputeDevices;
-extern uint32_t gDeviceFrequency;
+struct ConversionsTest;
 
 namespace conv_test {
 
@@ -126,56 +126,27 @@ cl_program MakeProgram(Type outType, Type inType, SaturationMode sat,
                        RoundingMode round, int vectorSize,
                        cl_kernel *outKernel);
 
-int RunKernel(cl_kernel kernel, void *inBuf, void *outBuf, size_t blockCount);
-
-int GetTestCase(const char *name, Type *outType, Type *inType,
-                SaturationMode *sat, RoundingMode *round);
-
 cl_int InitData(cl_uint job_id, cl_uint thread_id, void *p);
 cl_int PrepareReference(cl_uint job_id, cl_uint thread_id, void *p);
-uint64_t GetTime(void);
-
-void WriteInputBufferComplete(void *);
 }
 
 struct CalcRefValsBase
 {
+    CalcRefValsBase(struct buffers &buffers_): buffers(buffers_) {};
     virtual ~CalcRefValsBase() = default;
     virtual int check_result(void *, uint32_t, int) { return 0; }
 
-    // pointer back to the parent WriteInputBufferInfo struct
-    struct WriteInputBufferInfo *parent;
     clKernelWrapper kernel; // the kernel for this vector size
     clProgramWrapper program; // the program for this vector size
-    cl_uint vectorSize; // the vector size for this callback chain
-    void *p; // the pointer to mapped result data for this vector size
-    cl_int result;
+    struct buffers &buffers;
+    cl_event event;
 };
 
 template <typename InType, typename OutType, bool InFP, bool OutFP>
 struct CalcRefValsPat : CalcRefValsBase
 {
+    CalcRefValsPat(struct buffers &buffers): CalcRefValsBase(buffers) {}
     int check_result(void *, uint32_t, int) override;
-};
-
-struct WriteInputBufferInfo
-{
-    WriteInputBufferInfo()
-        : calcReferenceValues(nullptr), doneBarrier(nullptr), count(0),
-          outType(kuchar), inType(kuchar), barrierCount(0)
-    {}
-
-    volatile cl_event
-        calcReferenceValues; // user event which signals when main thread is
-                             // done calculating reference values
-    volatile cl_event
-        doneBarrier; // user event which signals when worker threads are done
-    cl_uint count; // the number of elements in the array
-    Type outType; // the data type of the conversion result
-    Type inType; // the data type of the conversion input
-    volatile int barrierCount;
-
-    std::vector<std::unique_ptr<CalcRefValsBase>> calcInfo;
 };
 
 int RunTest(cl_device_id device, cl_context context, cl_command_queue queue,
@@ -184,7 +155,7 @@ int RunTest(cl_device_id device, cl_context context, cl_command_queue queue,
 struct ConversionsTest
 {
     template <typename InType, typename OutType, bool InFP, bool OutFP>
-    test_status DoTest();
+    test_status DoTest(struct buffers &buffers);
 
     Type outType;
     Type inType;
@@ -194,5 +165,4 @@ struct ConversionsTest
 };
 
 #endif /* BASIC_TEST_CONVERSIONS_H */
-
 

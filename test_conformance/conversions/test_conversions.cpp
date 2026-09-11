@@ -62,20 +62,12 @@
 #include "fplib.h"
 #endif
 
-#if (defined(__arm__) || defined(__aarch64__)) && defined(__GNUC__)
-/* Rounding modes and saturation for use with qcom 64 bit to float conversion
- * library */
-bool qcom_sat;
-roundingMode qcom_rm;
-#endif
-
-static std::vector<ConversionsTest> tests;
-
 static test_status ParseArgs(int &argc, const char *argv[],
                              std::vector<std::string> &removed_args,
                              std::string &help);
 static test_status InitCL(cl_device_id device);
 
+static std::vector<ConversionsTest> tests;
 
 int main(int argc, const char **argv)
 {
@@ -96,19 +88,20 @@ int main(int argc, const char **argv)
     int ret =
         runTestHarnessWithCheckAndParse(argc, argv, true, 0, InitCL, ParseArgs);
 
-    if (gQueue)
+    for (auto &buffers : buffers_vec)
     {
-        int error = clFinish(gQueue);
-        if (error) vlog_error("clFinish failed: %d\n", error);
-    }
+        clReleaseMemObject(buffers.inBuffer);
+        free(buffers.in);
+        free(buffers.allowZ);
+        free(buffers.ref);
 
-    clReleaseMemObject(gInBuffer);
-
-    for (int i = 0; i < kCallStyleCount; i++)
-    {
-        clReleaseMemObject(gOutBuffers[i]);
+        for (int i = 0; i < kCallStyleCount; i++)
+        {
+            clReleaseMemObject(buffers.outBuffers[i]);
+            free(buffers.out[i]);
+        }
+        clReleaseCommandQueue(buffers.queue);
     }
-    clReleaseCommandQueue(gQueue);
     clReleaseContext(gContext);
 
     return ret;
@@ -256,7 +249,6 @@ Test names:
     update_argc_argv_from_args_list(argList, argc, argv);
 
     return TEST_PASS;
-
 }
 
 
@@ -351,7 +343,7 @@ static test_status InitCL(cl_device_id device)
 
             if (0 == (floatCapabilities & CL_FP_ROUND_TO_ZERO))
             {
-                vlog_error("FAILURE: embedded profile device supports neither "
+                vlog_error("FAILURE: device supports neither "
                            "CL_FP_ROUND_TO_NEAREST or CL_FP_ROUND_TO_ZERO\n");
                 return TEST_FAIL;
             }
@@ -364,7 +356,6 @@ static test_status InitCL(cl_device_id device)
             gDefaultHalfRoundingMode = CL_HALF_RTE;
         }
     }
-    DataInitInfo::halfRoundingMode = gDefaultHalfRoundingMode;
     gTestHalfs &= gHasHalfs;
 
     // detect whether profile of the device is embedded
@@ -386,47 +377,6 @@ static test_status InitCL(cl_device_id device)
     {
         vlog_error("clCreateContext failed. (%d)\n", error);
         return TEST_FAIL;
-    }
-
-    gQueue = clCreateCommandQueue(gContext, device, 0, &error);
-    if (NULL == gQueue || error)
-    {
-        vlog_error("clCreateCommandQueue failed. (%d)\n", error);
-        return TEST_FAIL;
-    }
-
-    // Allocate buffers
-    // FIXME: use clProtectedArray for guarded allocations?
-    gIn = malloc(BUFFER_SIZE + 2 * kPageSize);
-    gAllowZ = malloc(BUFFER_SIZE + 2 * kPageSize);
-    gRef = malloc(BUFFER_SIZE + 2 * kPageSize);
-    for (i = 0; i < kCallStyleCount; i++)
-    {
-        gOut[i] = malloc(BUFFER_SIZE + 2 * kPageSize);
-        if (NULL == gOut[i]) return TEST_FAIL;
-    }
-
-    // setup input buffers
-    gInBuffer =
-        clCreateBuffer(gContext, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
-                       BUFFER_SIZE, NULL, &error);
-    if (gInBuffer == NULL || error)
-    {
-        vlog_error("clCreateBuffer failed for input (%d)\n", error);
-        return TEST_FAIL;
-    }
-
-    // setup output buffers
-    for (i = 0; i < kCallStyleCount; i++)
-    {
-        gOutBuffers[i] =
-            clCreateBuffer(gContext, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
-                           BUFFER_SIZE, NULL, &error);
-        if (gOutBuffers[i] == NULL || error)
-        {
-            vlog_error("clCreateArray failed for output (%d)\n", error);
-            return TEST_FAIL;
-        }
     }
 
     char c[1024];
