@@ -53,6 +53,8 @@
 #include "Sleep.h"
 
 #include "basic_test_conversions.h"
+#include "conversions_data_info.h"
+
 #include <climits>
 #include <cstring>
 
@@ -67,41 +69,12 @@ bool qcom_sat;
 roundingMode qcom_rm;
 #endif
 
+static std::vector<ConversionsTest> tests;
 
 static test_status ParseArgs(int &argc, const char *argv[],
                              std::vector<std::string> &removed_args,
                              std::string &help);
-test_status InitCL(cl_device_id device);
-
-
-const char *gTypeNames[kTypeCount] = { "uchar",  "char",  "ushort", "short",
-                                       "uint",   "int",   "half",   "float",
-                                       "double", "ulong", "long" };
-
-const char *gRoundingModeNames[kRoundingModeCount] = { "", "_rte", "_rtp",
-                                                       "_rtn", "_rtz" };
-
-const char *gSaturationNames[2] = { "", "_sat" };
-
-size_t gTypeSizes[kTypeCount] = {
-    sizeof(cl_uchar),  sizeof(cl_char),  sizeof(cl_ushort), sizeof(cl_short),
-    sizeof(cl_uint),   sizeof(cl_int),   sizeof(cl_half),   sizeof(cl_float),
-    sizeof(cl_double), sizeof(cl_ulong), sizeof(cl_long),
-};
-
-REGISTER_TEST(conversions)
-{
-    if (argList.size() > 2)
-    {
-        return MakeAndRunTest<CustomConversionsTest>(device, context, queue,
-                                                     num_elements);
-    }
-    else
-    {
-        return MakeAndRunTest<ConversionsTest>(device, context, queue,
-                                               num_elements);
-    }
-}
+static test_status InitCL(cl_device_id device);
 
 
 int main(int argc, const char **argv)
@@ -123,7 +96,6 @@ int main(int argc, const char **argv)
     int ret =
         runTestHarnessWithCheckAndParse(argc, argv, true, 0, InitCL, ParseArgs);
 
-    free_mtdata(gMTdata);
     if (gQueue)
     {
         int error = clFinish(gQueue);
@@ -158,9 +130,6 @@ static test_status ParseArgs(int &argc, const char *argv[],
         -a     Test 2^32 values, not just special & random values. (default: off)
         -#     Test just vector size given by #, where # is an element of the set {1,2,3,4,8,16}
 
-        You may also pass the number of the test on which to start.
-        A second number can be then passed to indicate how many tests to run
-
 Test names:
         destFormat<_sat><_round>_sourceFormat
         Possible format types are:
@@ -178,44 +147,47 @@ Test names:
           char_sat_rte_float   converts float to char with saturated clipping in round to nearest rounding mode
 )";
 
-    if (gListTests)
+    for (unsigned dst = 0; dst < kTypeCount; dst++)
     {
-        for (unsigned dst = 0; dst < kTypeCount; dst++)
+        for (unsigned src = 0; src < kTypeCount; src++)
         {
-            for (unsigned src = 0; src < kTypeCount; src++)
+            for (unsigned sat = 0; sat < 2; sat++)
             {
-                for (unsigned sat = 0; sat < 2; sat++)
+                // skip illegal saturated conversions to float type
+                if (gSaturationNames[sat] == std::string("_sat")
+                    && (gTypeNames[dst] == std::string("float")
+                        || gTypeNames[dst] == std::string("half")
+                        || gTypeNames[dst] == std::string("double")))
                 {
-                    // skip illegal saturated conversions to float type
-                    if (gSaturationNames[sat] == std::string("_sat")
-                        && (gTypeNames[dst] == std::string("float")
-                            || gTypeNames[dst] == std::string("half")
-                            || gTypeNames[dst] == std::string("double")))
-                    {
-                        continue;
-                    }
-                    for (unsigned rnd = 0; rnd < kRoundingModeCount; rnd++)
-                    {
-                        vlog("\t%s\n",
-                             (std::string(gTypeNames[dst])
-                              + gSaturationNames[sat] + gRoundingModeNames[rnd]
-                              + "_" + gTypeNames[src])
-                                 .c_str());
-                    }
+                    continue;
+                }
+                for (unsigned rnd = 0; rnd < kRoundingModeCount; rnd++)
+                {
+                    std::string name;
+                    name += gTypeNames[dst];
+                    name += gSaturationNames[sat];
+                    name += gRoundingModeNames[rnd];
+                    name += "_";
+                    name += gTypeNames[src];
+                    tests.push_back({ (Type)dst, (Type)src, (SaturationMode)sat,
+                                      (RoundingMode)rnd, name });
                 }
             }
         }
-        return TEST_PASS;
+    }
+    for (const auto &test : tests)
+    {
+        test_registry::getInstance().add_test(RunTest, test.name.c_str(),
+                                              Version(1, 2), (void *)&test);
     }
 
+    std::vector<const char *> argList;
     argList.push_back(argv[0]);
-    argList.push_back("all");
     for (i = 1; i < argc; i++)
     {
         const char *arg = argv[i];
         if (NULL == arg) break;
 
-        vlog("\t%s", arg);
         if (arg[0] == '-')
         {
             arg++;
@@ -278,58 +250,29 @@ Test names:
         }
         else
         {
-            char *t = NULL;
-            long number = strtol(arg, &t, 0);
-            if (t != arg)
-            {
-                if (gStartTestNumber != -1)
-                    gEndTestNumber = gStartTestNumber + (int)number;
-                else
-                    gStartTestNumber = (int)number;
-            }
-            else
-            {
-                removed_args.push_back(argv[i]);
-                argList.push_back(arg);
-            }
+            argList.push_back(arg);
         }
     }
     update_argc_argv_from_args_list(argList, argc, argv);
 
-    vlog("\n");
-
-    PrintArch();
-
-    if (gWimpyMode)
-    {
-        vlog("\n");
-        vlog("*** WARNING: Testing in Wimpy mode!                     ***\n");
-        vlog("*** Wimpy mode is not sufficient to verify correctness. ***\n");
-        vlog("*** It gives warm fuzzy feelings and then nevers calls. ***\n\n");
-        vlog("*** Wimpy Reduction Factor: %-27u ***\n\n",
-             gWimpyReductionFactor);
-    }
-
-    vlog("===========================================================\n");
-    vlog("Random seed: %u\n", gRandomSeed);
-    gMTdata = init_genrand(gRandomSeed);
-
     return TEST_PASS;
+
 }
 
 
-test_status InitCL(cl_device_id device)
+static test_status InitCL(cl_device_id device)
 {
     int error, i;
-    size_t configSize = sizeof(gComputeDevices);
-
-    if ((error = clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS,
-                                 configSize, &gComputeDevices, NULL)))
+    cl_uint gComputeDevices = 0;
+    if ((error =
+             clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS,
+                             sizeof(gComputeDevices), &gComputeDevices, NULL)))
         gComputeDevices = 1;
 
-    configSize = sizeof(gDeviceFrequency);
+    cl_uint gDeviceFrequency = 0;
     if ((error = clGetDeviceInfo(device, CL_DEVICE_MAX_CLOCK_FREQUENCY,
-                                 configSize, &gDeviceFrequency, NULL)))
+                                 sizeof(gDeviceFrequency), &gDeviceFrequency,
+                                 NULL)))
         gDeviceFrequency = 0;
 
     cl_device_fp_config floatCapabilities = 0;
@@ -414,8 +357,14 @@ test_status InitCL(cl_device_id device)
             }
 
             gIsHalfRTZ = 1;
+            gDefaultHalfRoundingMode = CL_HALF_RTZ;
+        }
+        else
+        {
+            gDefaultHalfRoundingMode = CL_HALF_RTE;
         }
     }
+    DataInitInfo::halfRoundingMode = gDefaultHalfRoundingMode;
     gTestHalfs &= gHasHalfs;
 
     // detect whether profile of the device is embedded
@@ -493,8 +442,8 @@ test_status InitCL(cl_device_id device)
     vlog("\tCL C Version: %s\n", c);
     clGetDeviceInfo(device, CL_DRIVER_VERSION, sizeof(c), c, NULL);
     vlog("\tDriver Version: %s\n", c);
-    vlog("\tProcessing with %zu devices\n", gComputeDevices);
-    vlog("\tDevice Frequency: %d MHz\n", gDeviceFrequency);
+    vlog("\tProcessing with %u devices\n", gComputeDevices);
+    vlog("\tDevice Frequency: %u MHz\n", gDeviceFrequency);
     vlog("\tSubnormal values supported for floats? %s\n",
          no_yes[0 != (CL_FP_DENORM & floatCapabilities)]);
     vlog("\tTesting with FTZ mode ON for floats? %s\n", no_yes[0 != gForceFTZ]);

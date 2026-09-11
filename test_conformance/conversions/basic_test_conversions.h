@@ -40,7 +40,21 @@
 #include <tuple>
 #include <vector>
 
-#include "conversions_data_info.h"
+#if (defined(__arm__) || defined(__aarch64__)) && defined(__GNUC__)
+/* Rounding modes and saturation for use with qcom 64 bit to float conversion
+ * library */
+#define CONVERSIONS_QCOM 1
+#else
+#define CONVERSIONS_QCOM 0
+#endif
+
+typedef enum
+{
+    kUnsaturated = 0,
+    kSaturated,
+
+    kSaturationModeCount
+} SaturationMode;
 
 #define kVectorSizeCount 6
 #define kMaxVectorSize 16
@@ -54,7 +68,7 @@ extern const char *gTypeNames[ kTypeCount ];
 extern const char *gRoundingModeNames[ kRoundingModeCount ];        // { "", "_rte", "_rtp", "_rtn", "_rtz" }
 extern const char *gSaturationNames[ kSaturationModeCount ];        // { "", "_sat" }
 extern const char *gVectorSizeNames[kVectorSizeCount];              // { "", "2", "4", "8", "16" }
-extern size_t gTypeSizes[ kTypeCount ];
+extern const size_t gTypeSizes[kTypeCount];
 
 //Functions for clamping floating point numbers into the representable range for the type
 typedef float (*clampf)( float );
@@ -90,6 +104,7 @@ extern int gEndTestNumber;
 extern int gIsRTZ;
 extern int gForceHalfFTZ;
 extern int gIsHalfRTZ;
+extern cl_half_rounding_mode gDefaultHalfRoundingMode;
 extern void *gIn;
 extern void *gRef;
 extern void *gAllowZ;
@@ -163,242 +178,21 @@ struct WriteInputBufferInfo
     std::vector<std::unique_ptr<CalcRefValsBase>> calcInfo;
 };
 
-// Must be aligned with Type enums!
-using TypeIter =
-    std::tuple<cl_uchar, cl_char, cl_ushort, cl_short, cl_uint, cl_int, cl_half,
-               cl_float, cl_double, cl_ulong, cl_long>;
+int RunTest(cl_device_id device, cl_context context, cl_command_queue queue,
+            int num_elements, void *arg);
 
-// hardcoded solution needed due to typeid confusing cl_ushort/cl_half
-constexpr bool isTypeFp[] = { 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
-
-// Helper test fixture for constructing OpenCL objects used in testing
-// a variety of simple command-buffer enqueue scenarios.
 struct ConversionsTest
 {
-    virtual ~ConversionsTest() = default;
-
-    ConversionsTest(cl_device_id device, cl_context context,
-                    cl_command_queue queue);
-
-    cl_int SetUp(int elements);
-
-    // Test body returning an OpenCL error code
-    cl_int Run();
-
     template <typename InType, typename OutType, bool InFP, bool OutFP>
-    int DoTest(Type outType, Type inType, SaturationMode sat,
-               RoundingMode round);
+    test_status DoTest();
 
-    template <typename InType, typename OutType, bool InFP, bool OutFP>
-    void TestTypesConversion(const Type &inType, const Type &outType, int &tn,
-                             int startMinVectorSize);
-
-protected:
-    cl_context context;
-    cl_device_id device;
-    cl_command_queue queue;
-
-    size_t num_elements;
-
-    TypeIter typeIterator;
-
-public:
-    static cl_half_rounding_mode defaultHalfRoundingMode;
-};
-
-struct CustomConversionsTest : ConversionsTest
-{
-    CustomConversionsTest(cl_device_id device, cl_context context,
-                          cl_command_queue queue)
-        : ConversionsTest(device, context, queue)
-    {}
-
-    cl_int Run();
-};
-
-template <class T>
-int MakeAndRunTest(cl_device_id device, cl_context context,
-                   cl_command_queue queue, int num_elements)
-{
-    T test_fixture(device, context, queue);
-
-    cl_int error = test_fixture.SetUp(num_elements);
-    test_error_ret(error, "Error in test initialization", TEST_FAIL);
-
-    return test_fixture.Run();
-}
-
-struct TestType
-{
-    template <typename T, bool FP> bool testType(Type in)
-    {
-        switch (in)
-        {
-            default: return false;
-            case kuchar: return std::is_same<cl_uchar, T>::value;
-            case kchar: return std::is_same<cl_char, T>::value;
-            case kushort: return std::is_same<cl_ushort, T>::value && !FP;
-            case kshort: return std::is_same<cl_short, T>::value;
-            case kuint: return std::is_same<cl_uint, T>::value;
-            case kint: return std::is_same<cl_int, T>::value;
-            case khalf: return std::is_same<cl_half, T>::value && FP;
-            case kfloat: return std::is_same<cl_float, T>::value;
-            case kdouble: return std::is_same<cl_double, T>::value;
-            case kulong: return std::is_same<cl_ulong, T>::value;
-            case klong: return std::is_same<cl_long, T>::value;
-        }
-    }
-};
-
-// Helper structures to iterate over all tuple attributes of different types
-struct IterOverTypes : public TestType
-{
-    IterOverTypes(const TypeIter &typeIter, ConversionsTest &test)
-        : inType((Type)0), outType((Type)0), typeIter(typeIter), test(test),
-          testNumber(-1), startMinVectorSize(gMinVectorSize)
-    {}
-
-    void Run() { for_each_out_elem(typeIter); }
-
-protected:
-    template <std::size_t Out = 0, typename OutType>
-    void iterate_out_type(const OutType &t)
-    {
-        for_each_in_elem<0, Out, OutType>(typeIter);
-        outType = (Type)(outType + 1);
-        inType = (Type)0;
-    }
-
-    template <std::size_t In, std::size_t Out, typename OutType,
-              typename InType>
-    void iterate_in_type(const InType &t)
-    {
-        if (!testType<InType, isTypeFp[In]>(inType))
-            vlog_error("Unexpected data type!\n");
-
-        if (!testType<OutType, isTypeFp[Out]>(outType))
-            vlog_error("Unexpected data type!\n");
-
-        // run the conversions
-        test.TestTypesConversion<InType, OutType, isTypeFp[In], isTypeFp[Out]>(
-            inType, outType, testNumber, startMinVectorSize);
-        inType = (Type)(inType + 1);
-    }
-
-    template <std::size_t Out = 0, typename... Tp>
-    inline typename std::enable_if<Out == sizeof...(Tp), void>::type
-    for_each_out_elem(
-        const std::tuple<Tp...> &) // Unused arguments are given no names.
-    {}
-
-    template <std::size_t Out = 0, typename... Tp>
-        inline typename std::enable_if < Out<sizeof...(Tp), void>::type
-        for_each_out_elem(const std::tuple<Tp...> &t)
-    {
-        iterate_out_type<Out>(std::get<Out>(t));
-        for_each_out_elem<Out + 1, Tp...>(t);
-    }
-
-    template <std::size_t In = 0, std::size_t Out, typename OutType,
-              typename... Tp>
-    inline typename std::enable_if<In == sizeof...(Tp), void>::type
-    for_each_in_elem(
-        const std::tuple<Tp...> &) // Unused arguments are given no names.
-    {}
-
-    template <std::size_t In = 0, std::size_t Out, typename OutType,
-              typename... Tp>
-        inline typename std::enable_if < In<sizeof...(Tp), void>::type
-        for_each_in_elem(const std::tuple<Tp...> &t)
-    {
-        iterate_in_type<In, Out, OutType>(std::get<In>(t));
-        for_each_in_elem<In + 1, Out, OutType, Tp...>(t);
-    }
-
-protected:
-    Type inType;
     Type outType;
-    const TypeIter &typeIter;
-    ConversionsTest &test;
-    int testNumber;
-    int startMinVectorSize;
-};
-
-
-// Helper structures to select type 2 type conversion test case
-struct IterOverSelectedTypes : public TestType
-{
-    IterOverSelectedTypes(const TypeIter &typeIter, ConversionsTest &test,
-                          const Type in, const Type out,
-                          const RoundingMode round, const SaturationMode sat)
-        : inType(in), outType(out), rounding(round), saturation(sat),
-          typeIter(typeIter), test(test), testNumber(-1),
-          startMinVectorSize(gMinVectorSize)
-    {}
-
-    void Run() { for_each_out_elem(typeIter); }
-
-protected:
-    template <std::size_t Out = 0, typename OutType>
-    void iterate_out_type(const OutType &t)
-    {
-        for_each_in_elem<0, Out, OutType>(typeIter);
-    }
-
-    template <std::size_t In, std::size_t Out, typename OutType,
-              typename InType>
-    void iterate_in_type(const InType &t)
-    {
-        if (testType<InType, isTypeFp[In]>(inType)
-            && testType<OutType, isTypeFp[Out]>(outType))
-        {
-            // run selected conversion
-            // testing of the result will happen afterwards
-            test.DoTest<InType, OutType, isTypeFp[In], isTypeFp[Out]>(
-                outType, inType, saturation, rounding);
-        }
-    }
-
-    template <std::size_t Out = 0, typename... Tp>
-    inline typename std::enable_if<Out == sizeof...(Tp), void>::type
-    for_each_out_elem(const std::tuple<Tp...> &)
-    {}
-
-    template <std::size_t Out = 0, typename... Tp>
-        inline typename std::enable_if < Out<sizeof...(Tp), void>::type
-        for_each_out_elem(const std::tuple<Tp...> &t)
-    {
-        iterate_out_type<Out>(std::get<Out>(t));
-        for_each_out_elem<Out + 1, Tp...>(t);
-    }
-
-    template <std::size_t In = 0, std::size_t Out, typename OutType,
-              typename... Tp>
-    inline typename std::enable_if<In == sizeof...(Tp), void>::type
-    for_each_in_elem(const std::tuple<Tp...> &)
-    {}
-
-    template <std::size_t In = 0, std::size_t Out, typename OutType,
-              typename... Tp>
-        inline typename std::enable_if < In<sizeof...(Tp), void>::type
-        for_each_in_elem(const std::tuple<Tp...> &t)
-    {
-        iterate_in_type<In, Out, OutType>(std::get<In>(t));
-        for_each_in_elem<In + 1, Out, OutType, Tp...>(t);
-    }
-
-protected:
     Type inType;
-    Type outType;
-    RoundingMode rounding;
-    SaturationMode saturation;
-
-    const TypeIter &typeIter;
-    ConversionsTest &test;
-    int testNumber;
-    int startMinVectorSize;
+    SaturationMode sat;
+    RoundingMode round;
+    std::string name;
 };
-
 
 #endif /* BASIC_TEST_CONVERSIONS_H */
+
 

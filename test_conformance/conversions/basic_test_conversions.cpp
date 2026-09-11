@@ -54,6 +54,7 @@
 #include <mutex>
 
 #include "basic_test_conversions.h"
+#include "conversions_data_info.h"
 
 #if defined(_M_IX86) || defined(_M_X64)
 #include <mmintrin.h>
@@ -66,6 +67,23 @@
 #include <emmintrin.h>
 #endif
 #endif
+
+const char *gTypeNames[kTypeCount] = { "uchar",  "char",  "ushort", "short",
+                                       "uint",   "int",   "half",   "float",
+                                       "double", "ulong", "long" };
+
+const char *gRoundingModeNames[kRoundingModeCount] = { "", "_rte", "_rtp",
+                                                       "_rtn", "_rtz" };
+
+const char *gSaturationNames[kSaturationModeCount] = { "", "_sat" };
+
+const size_t gTypeSizes[kTypeCount] = {
+    sizeof(cl_uchar),  sizeof(cl_char),  sizeof(cl_ushort), sizeof(cl_short),
+    sizeof(cl_uint),   sizeof(cl_int),   sizeof(cl_half),   sizeof(cl_float),
+    sizeof(cl_double), sizeof(cl_ulong), sizeof(cl_long),
+};
+
+cl_half_rounding_mode gDefaultHalfRoundingMode = CL_HALF_RTE;
 
 cl_context gContext = NULL;
 cl_command_queue gQueue = NULL;
@@ -99,7 +117,6 @@ std::vector<const char *> argList;
 bool gTestAll = false;
 
 cl_half_rounding_mode DataInitInfo::halfRoundingMode = CL_HALF_RTE;
-cl_half_rounding_mode ConversionsTest::defaultHalfRoundingMode = CL_HALF_RTE;
 
 // Windows (since long double got deprecated) sets the x87 to 53-bit precision
 // (that's x87 default state).  This causes problems with the tests that
@@ -216,235 +233,76 @@ cl_uint RoundUpToNextPowerOfTwo(cl_uint x)
 }
 
 
-cl_int CustomConversionsTest::Run()
+template <typename T, bool IsFP> struct TypeTag
 {
-    int startMinVectorSize = gMinVectorSize;
-    Type inType, outType;
-    RoundingMode round;
-    SaturationMode sat;
+    using type = T;
+    static constexpr bool is_fp = IsFP;
+};
 
-    for (int i = 2; i < argList.size(); i++)
+template <typename F> test_status dispatch_type(Type t, F &&f)
+{
+    switch (t)
     {
-        if (conv_test::GetTestCase(argList[i], &outType, &inType, &sat, &round))
-        {
-            vlog_error("\n\t\t**** ERROR:  Unable to parse function name "
-                       "%s.  Skipping....  *****\n\n",
-                       argList[i]);
-            continue;
-        }
-
-        // skip double if we don't have it
-        if (!gTestDouble && (inType == kdouble || outType == kdouble))
-        {
-            if (gHasDouble)
-            {
-                vlog_error("\t *** convert_%sn%s%s( %sn ) FAILED ** \n",
-                           gTypeNames[outType], gSaturationNames[sat],
-                           gRoundingModeNames[round], gTypeNames[inType]);
-                vlog("\t\tcl_khr_fp64 enabled, but double testing turned "
-                     "off.\n");
-            }
-            continue;
-        }
-
-        // skip half if we don't have it
-        if (!gTestHalfs && (inType == khalf || outType == khalf))
-        {
-            if (gHasHalfs)
-            {
-                vlog_error("\t *** convert_%sn%s%s( %sn ) FAILED ** \n",
-                           gTypeNames[outType], gSaturationNames[sat],
-                           gRoundingModeNames[round], gTypeNames[inType]);
-                vlog("\t\tcl_khr_fp16 enabled, but half testing turned "
-                     "off.\n");
-            }
-            continue;
-        }
-
-        // skip longs on embedded
-        if (!gHasLong
-            && (inType == klong || outType == klong || inType == kulong
-                || outType == kulong))
-        {
-            continue;
-        }
-
-        // Skip the implicit converts if the rounding mode is not default or
-        // test is saturated
-        if (0 == startMinVectorSize)
-        {
-            if (sat || round != kDefaultRoundingMode)
-                gMinVectorSize = 1;
-            else
-                gMinVectorSize = 0;
-        }
-
-        IterOverSelectedTypes iter(typeIterator, *this, inType, outType, round,
-                                   sat);
-
-        iter.Run();
-
-        if (gFailCount)
-        {
-            vlog_error("\t *** convert_%sn%s%s( %sn ) FAILED ** \n",
-                       gTypeNames[outType], gSaturationNames[sat],
-                       gRoundingModeNames[round], gTypeNames[inType]);
-        }
+        case kuchar: return f(TypeTag<cl_uchar, false>{});
+        case kchar: return f(TypeTag<cl_char, false>{});
+        case kushort: return f(TypeTag<cl_ushort, false>{});
+        case kshort: return f(TypeTag<cl_short, false>{});
+        case kuint: return f(TypeTag<cl_uint, false>{});
+        case kint: return f(TypeTag<cl_int, false>{});
+        case khalf: return f(TypeTag<cl_half, true>{});
+        case kfloat: return f(TypeTag<cl_float, true>{});
+        case kdouble: return f(TypeTag<cl_double, true>{});
+        case kulong: return f(TypeTag<cl_ulong, false>{});
+        case klong: return f(TypeTag<cl_long, false>{});
+        default: return TEST_SKIP;
     }
-
-    return gFailCount;
 }
 
-
-ConversionsTest::ConversionsTest(cl_device_id device, cl_context context,
-                                 cl_command_queue queue)
-    : context(context), device(device), queue(queue), num_elements(0),
-      typeIterator({ cl_uchar(0), cl_char(0), cl_ushort(0), cl_short(0),
-                     cl_uint(0), cl_int(0), cl_half(0), cl_float(0),
-                     cl_double(0), cl_ulong(0), cl_long(0) })
-{}
-
-
-cl_int ConversionsTest::Run()
+int RunTest(cl_device_id device, cl_context context, cl_command_queue queue,
+            int num_elements, void *arg)
 {
-    IterOverTypes iter(typeIterator, *this);
+    ConversionsTest *test = (ConversionsTest *)arg;
+    return dispatch_type(test->inType, [&](auto in_tag) {
+        using InType = typename decltype(in_tag)::type;
+        constexpr bool InFP = decltype(in_tag)::is_fp;
+        return dispatch_type(test->outType, [&](auto out_tag) {
+            using OutType = typename decltype(out_tag)::type;
+            constexpr bool OutFP = decltype(out_tag)::is_fp;
 
-    iter.Run();
-
-    return gFailCount;
-}
-
-
-cl_int ConversionsTest::SetUp(int elements)
-{
-    num_elements = elements;
-    if (is_extension_available(device, "cl_khr_fp16"))
-    {
-        const cl_device_fp_config fpConfigHalf =
-            get_default_rounding_mode(device, CL_DEVICE_HALF_FP_CONFIG);
-        if ((fpConfigHalf & CL_FP_ROUND_TO_NEAREST) != 0)
-        {
-            DataInitInfo::halfRoundingMode = CL_HALF_RTE;
-            ConversionsTest::defaultHalfRoundingMode = CL_HALF_RTE;
-        }
-        else if ((fpConfigHalf & CL_FP_ROUND_TO_ZERO) != 0)
-        {
-            DataInitInfo::halfRoundingMode = CL_HALF_RTZ;
-            ConversionsTest::defaultHalfRoundingMode = CL_HALF_RTZ;
-        }
-        else
-        {
-            log_error("Error while acquiring half rounding mode");
-            return TEST_FAIL;
-        }
-    }
-
-    return CL_SUCCESS;
+            return test->DoTest<InType, OutType, InFP, OutFP>();
+        });
+    });
 }
 
 template <typename InType, typename OutType, bool InFP, bool OutFP>
-void ConversionsTest::TestTypesConversion(const Type &inType,
-                                          const Type &outType, int &testNumber,
-                                          int startMinVectorSize)
-{
-    SaturationMode sat;
-    RoundingMode round;
-    int error;
-
-    // skip longs on embedded
-    if (!gHasLong
-        && (inType == klong || outType == klong || inType == kulong
-            || outType == kulong))
-    {
-        return;
-    }
-
-    for (sat = (SaturationMode)0; sat < kSaturationModeCount;
-         sat = (SaturationMode)(sat + 1))
-    {
-        // skip illegal saturated conversions to float type
-        if (kSaturated == sat
-            && (outType == kfloat || outType == kdouble || outType == khalf))
-        {
-            continue;
-        }
-
-        for (round = (RoundingMode)0; round < kRoundingModeCount;
-             round = (RoundingMode)(round + 1))
-        {
-            if (++testNumber < gStartTestNumber)
-            {
-                continue;
-            }
-            else
-            {
-                if (gEndTestNumber > 0 && testNumber >= gEndTestNumber) return;
-            }
-
-            vlog("%d) Testing convert_%sn%s%s( %sn ):\n", testNumber,
-                 gTypeNames[outType], gSaturationNames[sat],
-                 gRoundingModeNames[round], gTypeNames[inType]);
-
-            // skip double if we don't have it
-            if (!gTestDouble && (inType == kdouble || outType == kdouble))
-            {
-                if (gHasDouble)
-                {
-                    vlog_error("\t *** %d) convert_%sn%s%s( %sn ) "
-                               "FAILED ** \n",
-                               testNumber, gTypeNames[outType],
-                               gSaturationNames[sat], gRoundingModeNames[round],
-                               gTypeNames[inType]);
-                    vlog("\t\tcl_khr_fp64 enabled, but double "
-                         "testing turned off.\n");
-                }
-                continue;
-            }
-
-            // skip half if we don't have it
-            if (!gTestHalfs && (inType == khalf || outType == khalf))
-            {
-                if (gHasHalfs)
-                {
-                    vlog_error("\t *** convert_%sn%s%s( %sn ) FAILED ** \n",
-                               gTypeNames[outType], gSaturationNames[sat],
-                               gRoundingModeNames[round], gTypeNames[inType]);
-                    vlog("\t\tcl_khr_fp16 enabled, but half testing turned "
-                         "off.\n");
-                }
-                continue;
-            }
-
-            // Skip the implicit converts if the rounding mode is
-            // not default or test is saturated
-            if (0 == startMinVectorSize)
-            {
-                if (sat || round != kDefaultRoundingMode)
-                    gMinVectorSize = 1;
-                else
-                    gMinVectorSize = 0;
-            }
-
-            if ((error = DoTest<InType, OutType, InFP, OutFP>(outType, inType,
-                                                              sat, round)))
-            {
-                vlog_error("\t *** %d) convert_%sn%s%s( %sn ) "
-                           "FAILED ** \n",
-                           testNumber, gTypeNames[outType],
-                           gSaturationNames[sat], gRoundingModeNames[round],
-                           gTypeNames[inType]);
-            }
-        }
-    }
-}
-
-template <typename InType, typename OutType, bool InFP, bool OutFP>
-int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
-                            RoundingMode round)
+test_status ConversionsTest::DoTest()
 {
 #ifdef __APPLE__
     cl_ulong wall_start = mach_absolute_time();
 #endif
+    if ((!gTestDouble && (outType == Type::kdouble || inType == Type::kdouble))
+        || (!gTestHalfs && (outType == Type::khalf || inType == Type::khalf))
+        || (!gHasLong
+            && (outType == Type::klong || outType == Type::kulong
+                || inType == Type::klong || inType == Type::kulong)))
+    {
+        return TEST_SKIPPED_ITSELF;
+    }
+
+    struct MinVectorGuard
+    {
+        int &val;
+        int orig;
+        ~MinVectorGuard() { val = orig; }
+    } guard{ gMinVectorSize, gMinVectorSize };
+
+    if (0 == gMinVectorSize)
+    {
+        if (sat || round != kDefaultRoundingMode)
+            gMinVectorSize = 1;
+        else
+            gMinVectorSize = 0;
+    }
 
     cl_uint threads = GetThreadCount();
 
@@ -480,13 +338,13 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
         if (NULL == writeInputBufferInfo.calcInfo[vectorSize]->program)
         {
             gFailCount++;
-            return -1;
+            return TEST_FAIL;
         }
         if (NULL == writeInputBufferInfo.calcInfo[vectorSize]->kernel)
         {
             gFailCount++;
             vlog_error("\t\tFAILED -- Failed to create kernel.\n");
-            return -2;
+            return TEST_FAIL;
         }
 
         writeInputBufferInfo.calcInfo[vectorSize]->parent =
@@ -495,7 +353,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
         writeInputBufferInfo.calcInfo[vectorSize]->result = -1;
     }
 
-    if (gSkipTesting) return error;
+    if (gSkipTesting) return TEST_PASS;
 
     // Patch up rounding mode if default is RTZ
     // We leave the part above in default rounding mode so that the right kernel
@@ -560,7 +418,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
         {
             vlog_error("ERROR: Unable to create user event. (%d)\n", error);
             gFailCount++;
-            return error;
+            return TEST_FAIL;
         }
 
         // retain for consumption by MapOutputBufferComplete
@@ -572,7 +430,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
             {
                 vlog_error("ERROR: Unable to retain user event. (%d)\n", error);
                 gFailCount++;
-                return error;
+                return TEST_FAIL;
             }
         }
 
@@ -584,7 +442,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
             vlog_error("ERROR: Unable to create user event for barrier. (%d)\n",
                        error);
             gFailCount++;
-            return error;
+            return TEST_FAIL;
         }
 
         // retain for use by the callback that calls this
@@ -593,7 +451,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
             vlog_error("ERROR: Unable to retain user event doneBarrier. (%d)\n",
                        error);
             gFailCount++;
-            return error;
+            return TEST_FAIL;
         }
 
         //      Call this in a multithreaded manner
@@ -620,7 +478,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
         {
             vlog_error("ERROR: clEnqueueWriteBuffer failed. (%d)\n", error);
             gFailCount++;
-            return error;
+            return TEST_FAIL;
         }
 
         // Call completion callback for the write, which will enqueue the rest
@@ -632,7 +490,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
         {
             vlog_error("clFlush failed with error %d\n", error);
             gFailCount++;
-            return error;
+            return TEST_FAIL;
         }
 
         ThreadPool_Do(conv_test::PrepareReference, chunks, &init_info);
@@ -645,7 +503,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
                 "Error:  Failed to set user event status to CL_COMPLETE:  %d\n",
                 error);
             gFailCount++;
-            return error;
+            return TEST_FAIL;
         }
 
         // Wait for the event callbacks to finish verifying correctness.
@@ -654,7 +512,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
         {
             vlog_error("Error:  Failed to wait for barrier:  %d\n", error);
             gFailCount++;
-            return error;
+            return TEST_FAIL;
         }
 
         if ((error = clReleaseEvent(writeInputBufferInfo.calcReferenceValues)))
@@ -662,14 +520,14 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
             vlog_error("Error:  Failed to release calcReferenceValues:  %d\n",
                        error);
             gFailCount++;
-            return error;
+            return TEST_FAIL;
         }
 
         if ((error = clReleaseEvent(writeInputBufferInfo.doneBarrier)))
         {
             vlog_error("Error:  Failed to release done barrier:  %d\n", error);
             gFailCount++;
-            return error;
+            return TEST_FAIL;
         }
 
         for (vectorSize = gMinVectorSize; vectorSize < gMaxVectorSize;
@@ -727,7 +585,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
                          sizeNames[vectorSize]);
 
                 gFailCount++;
-                return error;
+                return TEST_FAIL;
             }
         }
     }
@@ -746,7 +604,7 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
     vlog("\n\n");
     fflush(stdout);
 
-    return error;
+    return error ? TEST_FAIL : TEST_PASS;
 }
 
 #if !defined(__APPLE__)
@@ -1031,7 +889,7 @@ cl_int PrepareReference(cl_uint job_id, cl_uint thread_id, void *p)
                 default:
                 case kDefaultRoundingMode:
                     DataInitInfo::halfRoundingMode =
-                        ConversionsTest::defaultHalfRoundingMode;
+                        gDefaultHalfRoundingMode;
                     break;
                 case kRoundToNearestEven:
                     DataInitInfo::halfRoundingMode = CL_HALF_RTE;

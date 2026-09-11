@@ -35,6 +35,8 @@ extern roundingMode qcom_rm;
 #include "harness/rounding_mode.h"
 #include "harness/typeWrappers.h"
 
+#include "basic_test_conversions.h"
+
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -43,18 +45,6 @@ extern roundingMode qcom_rm;
 #include <sys/param.h>
 #include <libgen.h>
 #endif
-
-extern size_t gTypeSizes[kTypeCount];
-extern void *gIn;
-extern bool gTestAll;
-
-typedef enum
-{
-    kUnsaturated = 0,
-    kSaturated,
-
-    kSaturationModeCount
-} SaturationMode;
 
 struct DataInitInfo
 {
