@@ -17,6 +17,7 @@ set(${MODULE_NAME}_SOURCES
     test_subgroup_shuffle.cpp
     test_subgroup_shuffle_relative.cpp
     test_subgroup_rotate.cpp
+    ${CLConform_SOURCE_DIR}/test_common/harness/mt19937.cpp
 )
 
 include(../CMakeCommon.txt)
