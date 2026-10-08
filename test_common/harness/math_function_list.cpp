@@ -14,7 +14,7 @@
 // limitations under the License.
 //
 
-#include "harness/function_list.h"
+#include "harness/math_function_list.h"
 #ifndef FUNCTION_LIST_ULPS_ONLY
 #include "reference_math.h"
 #include "test_functions.h"

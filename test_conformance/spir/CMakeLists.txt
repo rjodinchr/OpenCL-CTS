@@ -6,7 +6,7 @@ set (${MODULE_NAME}_SOURCES
     run_build_test.cpp
     run_services.cpp
     kernelargs.cpp
-    ${CLConform_SOURCE_DIR}/test_common/harness/function_list.cpp
+    ${CLConform_SOURCE_DIR}/test_common/harness/math_function_list.cpp
 )
 
 include(../CMakeCommon.txt)

@@ -18,7 +18,7 @@ set(${MODULE_NAME}_SOURCES
     common.cpp
     common.h
     edge_cases.cpp
-    ${CLConform_SOURCE_DIR}/test_common/harness/function_list.cpp
+    ${CLConform_SOURCE_DIR}/test_common/harness/math_function_list.cpp
     i_unary_double.cpp
     i_unary_float.cpp
     i_unary_half.cpp
